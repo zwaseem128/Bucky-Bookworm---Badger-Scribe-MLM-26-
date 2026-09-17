@@ -1,137 +1,151 @@
 # Badger Scribe — MVP plan
 
-**Goal of the MVP:** one model, one prompt, one local scorer, one valid Kaggle submission, all
-runnable by any of us in under an hour. Not the best score — the *baseline* every later
-component is A/B'd against.
+**What we're building first:** the simplest pipeline that reads a manuscript image, sends it to a
+model, writes the text out, and gets a score on Kaggle. Not the best score. A **baseline** —
+the thing every later idea is measured against.
 
-**Verdict on the original draft:** the kernel (run existing models zero-shot → submit → compare)
-is right. Everything else in the draft is either a later A/B (orientation, contrast) or not an
-MVP at all (per-character statistical classifier). See "What we cut" at the bottom.
+**Deadline:** MLM26 ends Dec 9. Steps 0–5 below are due the week of **Sept 24**.
 
-MLM26 runs Sept 9 – Dec 9. Steps 0–5 are week one. If we're not on step 5 by **Sept 24**, we
-are over-building.
+Everything here follows [CONTRIBUTING.md](CONTRIBUTING.md): one branch and one PR per step,
+one reviewer, `CLAIM:` a file before editing it.
 
-## Definitions
+## Words we'll use
 
-| term | meaning |
+| word | plain meaning |
 |---|---|
-| **input** | one page image + its metadata row (at minimum: id, language) |
-| **output** | one UTF-8 transcription string per page id, in the sample-submission format |
-| **dev split** | 50 labelled train pages, fixed and committed (`configs/dev_ids.csv`), stratified by language |
-| **score** | our local implementation of the Kaggle metric, run on the dev split. **Never** the leaderboard — we get a handful of submissions a day; the leaderboard confirms, it doesn't iterate |
-| **baseline** | the best row in `docs/experiments.md` after step 6. Every PR after that reports its delta against it |
+| **VLM** | a model that looks at an image and answers in text. CHURRO and Qwen-VL on BadgerBrain are VLMs. |
+| **CER / metric** | the number Kaggle uses to score us. Probably "character error rate" — fraction of characters we got wrong. **Step 0 confirms this.** Lower is better (if it's CER). |
+| **dev set** | 50 training pages we set aside and never change. We score every idea on these same 50 pages so results are comparable. |
+| **baseline** | the best result we have so far. Any new idea has to beat it on the dev set to be kept. |
+| **LB** | the Kaggle leaderboard. We only get a few submissions per day, so we test locally first and use the LB to confirm. |
 
-## Steps
+## Where things go (per CONTRIBUTING.md)
 
-### 0. Read the rules and the metric — day 1, everyone, 30 min
-Open the competition Overview + Data tabs together. Write into this file, verbatim:
-- the metric (CER? WER? normalized how? case-folded? whitespace-collapsed?)
-- submissions per day, and whether the public LB is a subset of test
-- whether pretrained/external models and internet are allowed (they must be — the whole plan is hosted VLMs)
-- train / test counts, image format, every metadata column
+| what | where |
+|---|---|
+| the scoring function | `src/shared/metric.py` |
+| loading images + metadata, making the dev set | `src/data/` |
+| talking to BadgerBrain, one file per model | `src/services/badgerbrain.py`, `src/services/models/churro.py`, `…/qwen_vl.py` |
+| the pipeline (image → model → text → submission file) | `src/features/transcribe/` |
+| tests | `tests/`, next to what they test |
+| notes, results table, error analysis, notebooks | `docs/`, `docs/notebooks/` |
+| predictions and submission files | `outputs/` — **gitignored**. This is one new top-level folder; approve it in team chat at step 0 as CONTRIBUTING requires. |
 
-**Works when:** the four bullets above are filled in and nobody disagrees with them.
+## Steps — at a glance
 
-### 1. Look at the data — [LP], by Sept 19
-`notebooks/lp-data-look.ipynb`. Twenty random train pages side-by-side with their labels. Count
-languages, image sizes, and — by eye — how many pages are rotated, faint, multi-column, or have
-marginalia. Note whether labels are page-level or line-level and whether line breaks are preserved.
+| # | step | who | done by | you know it works when |
+|---|---|---|---|---|
+| 0 | Read the Kaggle rules and metric together | all | Sept 18 | the facts are written into this file |
+| 1 | Look at the data | LP | Sept 19 | `docs/data-notes.md` has counts |
+| 2 | Write the scorer | LD | Sept 19 | tests pass |
+| 3 | Make the dev set | LD | Sept 19 | `src/data/dev_ids.csv` is on `main` |
+| 4 | Pipeline with a fake model | ZW | Sept 22 | Kaggle accepts the submission |
+| 5 | First real model: CHURRO | CO | Sept 24 | dev score + LB score in the results table → **baseline** |
+| 6 | Second model + language hint | CO, ZW | Sept 26 | 4 rows in the results table |
+| 7 | Look at the worst pages | all | Sept 29 | `docs/error-analysis.md` has counts |
+| 8 | Try improvements one at a time | all | Oct → | each beats the baseline on dev, then on LB |
 
-**Works when:** a ten-line summary lands in `docs/data-notes.md` with counts, and it answers
-"do we even have an orientation problem?" with a number.
+## Steps — details
 
-### 2. Local scorer — [LD], by Sept 19
-`badger_scribe/eval/metric.py` implementing exactly the metric from step 0.
-`tests/eval/test_metric.py` with: perfect prediction → 0 error; empty prediction → 1.0 (or
-whatever the metric gives); one known edit → the hand-computed value.
+### 0. Read the rules and the metric (everyone, 30 min, Sept 18)
+Open the Kaggle Overview and Data tabs together and write the answers here, word for word:
+- Metric: ____ (CER? WER? is case ignored? is whitespace collapsed?)
+- Submissions per day: ____
+- Train pages: ____ Test pages: ____ Image format: ____
+- Metadata columns: ____
+- Pretrained models and internet allowed? ____ (must be yes — the plan depends on BadgerBrain)
 
-**Works when:** tests pass, and after step 5 the dev score and the public LB score for the same
-model are in the same ballpark. If they're wildly different our normalization is wrong — fix
-before anything else.
+Also approve the `outputs/` folder in team chat.
 
-### 3. Dev split — [LD], with step 2
-`scripts/make_dev_split.py --seed 0 --n 50` → `configs/dev_ids.csv`. Stratified by language.
-Committed. Nobody re-samples it.
+### 1. Look at the data (LP, Sept 19)
+Notebook in `docs/notebooks/lp-data-look.ipynb`. Show 20 random training pages next to their
+correct text. Count: languages, image sizes, and — just by looking — how many pages are rotated,
+faint, in columns, or have writing in the margins. Note whether the correct text keeps line breaks.
 
-**Works when:** the file is on `main` and `score.py` refuses to run on anything else by default.
+**Works when:** `docs/data-notes.md` has those counts. In particular it answers "how many of 20
+pages are rotated?" with a number, so we know whether orientation is even a problem.
 
-### 4. Pipeline skeleton with a dummy model — [ZW], by Sept 22
+### 2. Write the scorer (LD, Sept 19)
+`src/shared/metric.py` — the exact metric from step 0, nothing fancier.
+`tests/shared/test_metric.py` — three tests: perfect answer scores 0; empty answer scores 1
+(or whatever the metric says); one deliberate typo scores the value you computed by hand.
+
+**Works when:** the tests pass. Later (step 5) our dev score and the LB score should be close.
+If they aren't, this file is wrong — fix it before doing anything else.
+
+### 3. Make the dev set (LD, Sept 19)
+`src/data/make_dev_set.py` picks 50 training pages, spread across languages, with a fixed random
+seed, and writes `src/data/dev_ids.csv`. Commit the CSV. **Nobody regenerates it.**
+
+**Works when:** the CSV is on `main` and the scorer reads it by default.
+
+### 4. Pipeline with a fake model (ZW, Sept 22)
+Build the plumbing before any real model. Every model is one Python function:
+
+```python
+def transcribe(image, metadata) -> str
 ```
-scripts/transcribe.py --model dummy --split dev   →  artifacts/preds/dummy-dev.csv
-scripts/score.py artifacts/preds/dummy-dev.csv    →  prints score
-scripts/transcribe.py --model dummy --split test  →  artifacts/submissions/dummy.csv
-```
-Model adapters live in `badger_scribe/models/` and implement one function:
-`transcribe(image: PIL.Image, meta: dict) -> str`. The dummy returns `""`.
-Cache every model call to disk keyed by (model, prompt, image id) so re-runs are free.
 
-**Works when:** `dummy.csv` is **accepted by Kaggle** and appears on the leaderboard with a
-terrible score. That's submission #1 and the pipeline is real. Until this happens, nothing
-else counts as progress.
+The fake model returns `""`. The pipeline in `src/features/transcribe/` does:
 
-### 5. First real model: CHURRO — [CO], by Sept 24
-CHURRO is a ~3B open-weight VLM fine-tuned specifically for historical text recognition
-(page-level, many languages, centuries of scripts; claims to beat frontier APIs at far lower
-cost). It is on BadgerBrain, it's cheap, and it's the model most likely to just work. Adapter
-`badger_scribe/models/churro.py`, prompt = whatever the CHURRO paper uses, no language hint yet.
+1. load dev or test images + metadata (`src/data/`)
+2. call `transcribe` on each — save each result to disk so re-runs are free
+3. write `outputs/predictions/<model>-dev.csv` and score it
+4. write `outputs/submissions/<model>.csv` in Kaggle's format
 
-Run dev → score → run test → submit. Add the first row to `docs/experiments.md`:
+**Works when:** the fake model's submission is **accepted by Kaggle** and shows up on the LB
+with a terrible score. That's our first submission. Nothing counts as progress before this.
+
+### 5. First real model: CHURRO (CO, Sept 24)
+CHURRO is a small open model built specifically to read old handwritten documents. It's on
+BadgerBrain and cheap, so it's the one most likely to just work. Write
+`src/services/models/churro.py`, use the prompt from its paper, no language hint yet.
+
+Run dev → score → run test → submit. Start `docs/results.md`:
 
 | date | model | prompt | preprocessing | dev score | LB score | notes |
 |---|---|---|---|---|---|---|
 
-**Works when:** dev score and LB score are both recorded, and the dev/LB gap is small enough
-that we trust the dev score (step 2's check). **This row is the baseline.**
+**Works when:** the row has both scores and they're close. **This row is the baseline.**
 
-### 6. Second model + language hint — [CO]/[ZW], by Sept 26
-Same adapter interface, `badger_scribe/models/qwen_vl.py` against BadgerBrain's Qwen VL model.
-Then one prompt variant for each model: add `"The text is in {language}."` from metadata.
-That's four rows in the experiments table.
+### 6. Second model + language hint (CO and ZW, Sept 26)
+`src/services/models/qwen_vl.py` for BadgerBrain's Qwen vision model, same function shape.
+Then, for both models, one variant that adds `"The text is in {language}."` from the metadata.
 
-**Works when:** four rows exist, run on the same dev split with the same scorer. The best one
-becomes the baseline. Whatever the answer, we now know whether the language metadata is worth
-anything — the original draft assumed it; this measures it.
+**Works when:** `docs/results.md` has 4 rows on the same dev set. Best one is the new baseline.
+Now we *know* whether the language metadata helps instead of assuming it.
 
-### 7. Error analysis on the baseline — everyone, Sept 29 meeting
-Sort dev pages by per-page error. Everyone reads the worst ten. Tag each page: `orientation`,
-`faint/contrast`, `layout` (columns, margins, tables), `language`, `hallucination`,
-`omission`, `label-noise`. Count.
+### 7. Look at the worst pages (everyone, Sept 29 meeting)
+Sort the dev pages by score, worst first. Everyone reads the ten worst. Tag each one:
+`rotated` · `faint` · `layout` (columns, margins, tables) · `wrong language` · `made-up text` ·
+`skipped text` · `bad label`. Count the tags.
 
-**Works when:** `docs/error-analysis.md` has the counts. The biggest bucket is the first A/B.
-If `orientation` is 0/10, we never build orientation detection.
+**Works when:** `docs/error-analysis.md` has the counts. **The biggest tag is what we fix first.**
+If `rotated` is 0 out of 10, we never build orientation detection.
 
-### 8. A/B components — from Oct, one branch + one PR + one experiments row each
-Candidates, ordered by likely payoff per hour (re-order after step 7):
-1. Line/region segmentation before the VLM (VLMs skip and merge lines on dense pages)
-2. Contrast / binarization preprocessing (only if `faint` was a big bucket)
-3. Orientation detection (only if `orientation` was a big bucket; try the VLM first, then a 4-way rotation classifier)
-4. Few-shot: one solved page of the same language in the prompt
-5. Ensembling / majority vote across models
-6. Fine-tuning CHURRO on our train set — when AWS credits arrive, not before
+### 8. Try improvements, one at a time (from Oct)
+One idea = one branch (`chloe/data-contrast-preproc`) = one PR = one row in `docs/results.md`.
+Rough order, to be re-sorted after step 7:
 
-**Each works when:** dev score beats the baseline by more than the run-to-run noise (measure
-noise once by running the baseline twice), *then* one LB submission confirms it. Only then
-does it become the new baseline.
+1. Cut the page into lines or regions before sending to the model (VLMs skip lines on dense pages)
+2. Contrast / binarization — only if `faint` was a big tag
+3. Detect rotation — only if `rotated` was a big tag; ask the VLM first, build a classifier second
+4. Show the model one solved page in the same language (few-shot)
+5. Run both models and vote
+6. Fine-tune CHURRO on our training pages — when AWS credits arrive, not before
 
-## What we cut from the draft, and why
+**Each works when:** it beats the baseline on the dev set by more than the noise (run the
+baseline twice once to measure noise), *then* one LB submission confirms it.
 
-- **Per-character statistical classification with a language-specific charset.** Requires
-  character segmentation of 19th-century handwriting, which is the hard part of HTR; VLMs do
-  it implicitly and better. Weeks of work for a worse baseline.
-- **Orientation and contrast first.** They're preprocessing A/Bs, not the MVP. Step 7 decides
-  whether they're worth anything; step 1 gives us a first guess for free.
-- **Manual orientation fixing.** Only if step 7 says orientation is the biggest bucket *and*
-  the VLM can't fix it. Even then, a rotation classifier is a one-day build.
-- **"Compare how each scores in Kaggle."** Compare on the dev split with our scorer; use Kaggle
-  to confirm. Otherwise we burn the daily submission cap on things we could have measured locally.
+## What we dropped from the first draft, and why
 
-## Owners (proposal — reassign at the next meeting)
+- **Recognizing characters one at a time with a per-language character set.** That means
+  cutting handwriting into individual letters, which is the hardest part of the whole problem.
+  VLMs do it for us. Weeks of work for a worse result.
+- **Fixing orientation and contrast first.** Might matter, might not. Step 1 and step 7 tell us.
+- **Fixing orientation by hand.** Only if step 7 says it's the top problem *and* the VLM can't
+  handle it. Even then a rotation classifier is a one-day build.
+- **Comparing models on Kaggle.** Compare on the dev set. Kaggle confirms. Otherwise we burn our
+  daily submissions on things we could have measured in seconds.
 
-| | steps |
-|---|---|
-| LP | 1, 7 lead |
-| CO | 5, 6 |
-| LD | 2, 3, scorer/LB gap check |
-| ZW | 4, submission plumbing, 6 |
-
-Everyone: step 0, step 7.
+Owners above are a proposal — reassign at the next meeting.
