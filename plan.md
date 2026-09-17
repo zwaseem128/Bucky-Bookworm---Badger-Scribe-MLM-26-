@@ -34,7 +34,7 @@ using **open-weight models only**. A **writeup** in our repo is part of the subm
 
 | word | plain meaning |
 |---|---|
-| **VLM** | a model that looks at an image and answers in text. CHURRO and Qwen-VL on BadgerBrain are VLMs. |
+| **VLM** | a model that looks at an image and answers in text. `churro-3b` on BadgerBrain is one. An *embedding* model is not — it turns images into numbers for search and cannot transcribe. |
 | **CER** | character error rate: edits needed to turn our text into the truth, divided by the truth's length, capped at 1.0. Lower is better. Empty prediction = 1.0. |
 | **macro CER** | our actual score: CER averaged within each category, then averaged across categories. |
 | **category** | `kade_letters` (German), Dominy account books, survey notes — from `train.csv`/`test.csv`. |
@@ -80,6 +80,20 @@ using **open-weight models only**. A **writeup** in our repo is part of the subm
 - Approve `data/` and `outputs/` as gitignored top-level folders in team chat.
 - Open the Kaggle **starter notebooks**. If one already runs a VLM zero-shot end-to-end,
   step 5 starts from it instead of from scratch.
+- Everyone has a BadgerBrain key and has run the 5-line example in the
+  [gateway quickstart](https://github.com/qualiaMachine/RunAI_apps/blob/main/docs/gateway-quickstart.md).
+  Gateway: `https://llm-gw01.doit.wisc.edu/v1`, OpenAI-style API. What it hosts (Sept 2026):
+
+  | model | can it transcribe a page? |
+  |---|---|
+  | `churro-3b` | **yes** — the only vision model. Our step-5 model. |
+  | `qwen3.8-27b` | no — text only. Could post-correct text later (open-weight, so allowed). |
+  | `qwen3-vl-embedding-8b` | **no** — returns vectors, not text. Not a transcription model. |
+
+  BadgerBrain has one vision model, so **someone asks Chris at step 0** whether a second one
+  (e.g. `Qwen/Qwen2.5-VL-7B-Instruct`, the model in Kaggle's example writeup) can be hosted.
+  Otherwise step 6 runs it on Kaggle's free GPU. Fine-tuning (step 8) also isn't something
+  a gateway key can do — it needs a Run:ai account, Kaggle's GPU, or AWS credits.
 
 Facts we now know (from the Overview/Data tabs, Sept 17):
 - Files: `train.csv` (page_id, doc_id, text, category, label_source), `test.csv` (same minus
@@ -131,8 +145,9 @@ submission and proves the plumbing. Nothing counts as progress before this.
 
 ### 5. First real model: CHURRO (CO, Sept 24)
 CHURRO is a small open model built specifically for historical handwriting across many scripts,
-on BadgerBrain and cheap. `src/services/models/churro.py`, the prompt from its paper, no
-metadata yet. Run dev → score → run test → submit. Start `docs/results.md`:
+on BadgerBrain as `churro-3b`. `src/services/models/churro.py` sends the page as a base64 image
+with the quickstart's prompt, `"Transcribe this page."`, no metadata yet. Smoke-test on **one
+German train page (human label) and one English page (silver label)** before running the dev set. Run dev → score → run test → submit. Start `docs/results.md`:
 
 | date | model | prompt | preprocessing | dev macro CER | dev per-category | LB CER | notes |
 |---|---|---|---|---|---|---|---|
@@ -141,8 +156,9 @@ metadata yet. Run dev → score → run test → submit. Start `docs/results.md`
 Also start `WRITEUP.md` from the template and log this as the first thing we tried.
 
 ### 6. Second model + metadata in the prompt (CO and ZW, Sept 26)
-`src/services/models/qwen_vl.py` for BadgerBrain's Qwen vision model. Then one variant per
-model that adds the catalog metadata to the prompt: language (from category), plus `title`,
+`src/services/models/qwen_vl.py` for `Qwen/Qwen2.5-VL-7B-Instruct` — on BadgerBrain if Chris
+adds it, otherwise in a Kaggle GPU notebook (same `transcribe()` shape either way). Then one
+variant per model that adds the catalog metadata to the prompt: language (from category), plus `title`,
 `creator`, `date`, `summary` from `metadata.csv`. The organizers say names, dates and subject
 nouns are exactly what models misread and that metadata is worth feeding in.
 
@@ -150,8 +166,10 @@ nouns are exactly what models misread and that metadata is worth feeding in.
 
 ### 7. Look at the worst pages, per category (everyone, Sept 29 meeting)
 For each category, sort dev pages by CER, worst first; everyone reads the 5 worst. Tag each:
-`rotated` · `faint` · `layout` (columns, tables, margins) · `script` (Kurrent) ·
-`modernised spelling` · `made-up text` · `skipped text` · `bad label`. Count.
+`rotated` · `faint` · `stain/shadow/fold` · `underline/strikethrough` · `layout` (columns,
+tables, margins, wrong reading order) · `script` (Kurrent vs print vs cursive) ·
+`modernised spelling` · `translated instead of transcribed` · `made-up text` · `skipped text` ·
+`bad label`. Count.
 
 **Works when:** `docs/error-analysis.md` has the counts per category. **The biggest tag in
 the worst category is what we fix first.** If `rotated` is 0, we never build rotation detection.
@@ -161,7 +179,7 @@ One idea = one branch (`chloe/data-contrast-preproc`) = one PR = one row in `doc
 Order, to be re-sorted after step 7:
 
 1. **Fine-tune** on the human-labelled train pages (the starter recipe; ~1 GPU-hour on Kaggle's
-   free GPU or AWS credits). Train on `human` rows first — silver rows teach modernised
+   free GPU, a Run:ai account, or AWS credits — a BadgerBrain key alone can't do this). Train on `human` rows first — silver rows teach modernised
    spelling, which the metric punishes. Add the Alfred Escher Kurrent set from `RESOURCES.md`.
 2. Cut the page into lines/regions before the model (VLMs skip lines on dense pages)
 3. Contrast / binarization — only if `faint` was a big tag
@@ -180,6 +198,14 @@ models, peak_vram, leaderboard_cer, external_data, hardware, eval_wall_clock), p
 "Writeup Index" discussion thread. Organizers re-run our repo at that tag on one ≤96 GB GPU.
 
 **Works when:** the tag URL opens in a private browser window and the card is posted.
+
+## The prompt is part of the pipeline
+
+One standard prompt for every model, kept in `src/features/transcribe/prompt.py`, changed only
+via a PR with a results row. It must say what `transcription_conventions.md` says: transcribe
+**verbatim**, keep original spelling, casing and punctuation, keep reading order, one line per
+line, **do not translate or modernise** (Kurrent → modern German is translation, not
+transcription — prior-work threads about Sütterlin→Hochdeutsch are about a different task).
 
 ## What we dropped from the first draft, and why
 
