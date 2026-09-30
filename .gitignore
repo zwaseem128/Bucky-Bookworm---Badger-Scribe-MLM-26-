@@ -1,0 +1,7 @@
+# Kaggle download (images, train.csv, ...) and anything derived from it.
+# Leading slash: only the top-level folder, not src/data or tests/data.
+/data/
+# model predictions and submission files
+/outputs/
+__pycache__/
+.pytest_cache/
