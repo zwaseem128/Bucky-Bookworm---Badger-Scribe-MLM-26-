@@ -6,9 +6,9 @@ Run it and answer the question:
           categories, then run score_churro.py to see the macro CER
   5, all  transcribe that many images (or all of them) for a submission
 
-Each transcription is saved to churro_output/<image>.txt in
-Downloads/Bucky Bookworm Images. Every image gets a transcription: if the
-model answers with nothing (or only notes like [illegible]), the script
+Each transcription is saved to "output data"/<image>.txt in the Badger
+Scribe shared drive (G:/Shared drives/Badger Scribe), so the team sees it.
+Every image gets a transcription: if the model answers with nothing (or only notes like [illegible]), the script
 retries with other prompts, then reads the top and bottom halves separately.
 Only a network or gateway failure leaves a page without a file, and the next
 run with START_OVER = False picks those pages up.
@@ -34,7 +34,10 @@ from PIL import Image
 DATA = Path.home() / "Desktop" / "BuckyBookworm" / "data"
 IMAGES = DATA / "images"
 LABELS = DATA / "train.csv"
-OUT = Path.home() / "Downloads" / "Bucky Bookworm Images" / "churro_output"
+# Results go to the team's shared drive. score_churro.py reads from the same
+# folder, so change both if this moves.
+DRIVE = Path(r"G:\Shared drives\Badger Scribe")
+OUT = DRIVE / "output data"
 
 CATEGORY = {"dominy": "dominy_accounts", "kade": "kade_letters", "survey": "survey_notes"}
 
@@ -152,7 +155,7 @@ def encode(img):
 
 def ask(client, image_b64, prompt, temperature):
     resp = client.chat.completions.create(
-        model="qwen3.8-27b",
+        model="churro-3b",
         messages=[{"role": "user", "content": [
             {"type": "text", "text": prompt},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
@@ -229,6 +232,9 @@ START_OVER = True
 
 
 def main():
+    if not DRIVE.exists():
+        raise SystemExit(f"Can't find {DRIVE}. Is Google Drive for Desktop running "
+                         "and signed in to the account that has the shared drive?")
     OUT.mkdir(parents=True, exist_ok=True)
     all_images = sorted(IMAGES.glob("*.jpg"))
     answer = input("Type 'eval' to test on labeled train pages from every category,\n"
