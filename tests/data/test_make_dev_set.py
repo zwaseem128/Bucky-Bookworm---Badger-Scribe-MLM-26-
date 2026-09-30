@@ -80,8 +80,8 @@ def test_same_seed_same_answer_regardless_of_row_order():
     assert pick_dev_pages(rows, seed=0) != pick_dev_pages(rows, seed=1)
 
 
-def write_train(path):
-    with open(path, "w", newline="", encoding="utf-8") as f:
+def write_train(path, encoding="utf-8"):
+    with open(path, "w", newline="", encoding=encoding) as f:
         w = csv.DictWriter(f, fieldnames=["page_id", "doc_id", "text", "category", "label_source"])
         w.writeheader()
         w.writerows(fake_train())
@@ -110,6 +110,15 @@ def test_cli_writes_list_without_labels_and_never_repicks(tmp_path):
     # --force really does re-pick.
     subprocess.run(base + ["--seed", "7", "--force"], check=True, capture_output=True)
     assert out.read_text(encoding="utf-8") != first
+
+
+def test_cli_reads_train_csv_with_byte_order_mark(tmp_path):
+    # Kaggle's real train.csv starts with a UTF-8 BOM.
+    train = tmp_path / "train.csv"
+    write_train(train, encoding="utf-8-sig")
+    run = subprocess.run([sys.executable, str(SCRIPT), "--train", str(train), "--out", str(tmp_path / "dev_ids.csv"),
+                          "--solution-out", str(tmp_path / "sol.csv")], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
 
 
 def test_cli_rejects_a_list_that_does_not_match_train(tmp_path):

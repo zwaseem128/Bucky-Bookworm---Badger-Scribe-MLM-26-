@@ -41,7 +41,8 @@ DEV_COLUMNS = ["page_id", "doc_id", "category", "label_source"]
 
 def read_train(path):
     # csv, not pandas: pandas would read a transcribed "NA" as a missing value.
-    with open(path, newline="", encoding="utf-8") as f:
+    # utf-8-sig: Kaggle's train.csv starts with a byte-order mark.
+    with open(path, newline="", encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
     missing = {"page_id", "doc_id", "text", "category", "label_source"} - set(rows[0] if rows else {})
     if missing:
