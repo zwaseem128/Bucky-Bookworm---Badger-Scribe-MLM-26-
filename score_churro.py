@@ -6,7 +6,8 @@ numbers here come from the same code as the Kaggle leaderboard. Only pages
 that have a human transcription in train.csv can be scored; the rest are
 listed as "no label".
 
-Results go to churro_output/scores/:
+Transcriptions are read from "output data" on the shared drive (where
+churro_simple.py saves them). Results go to "output data"/scores/:
   page_scores.csv  one row per page: CER, WER, and both texts side by side
   summary.txt      the per-category table and the overall score
 """
@@ -16,11 +17,15 @@ from pathlib import Path
 
 import pandas as pd
 
-sys.path.insert(0, r"G:\Shared drives\Badger Scribe")
+DRIVE = Path(r"G:\Shared drives\Badger Scribe")
+
+# Don't leave a __pycache__ folder on the shared drive when importing metric.py.
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(DRIVE))
 import metric  # noqa: E402  (the shared drive copy, unmodified)
 
-LABELS = Path.home() / "Desktop" / "BuckyBookworm" / "data" / "train.csv"
-OUT = Path.home() / "Downloads" / "Bucky Bookworm Images" / "churro_output"
+LABELS = DRIVE / "train.csv"
+OUT = DRIVE / "output data"
 SCORES = OUT / "scores"
 SCORES.mkdir(exist_ok=True)
 
