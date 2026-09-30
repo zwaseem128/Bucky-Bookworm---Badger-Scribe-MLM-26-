@@ -29,15 +29,20 @@ from pathlib import Path
 from openai import OpenAI
 from PIL import Image
 
-# The Kaggle download in the team repo. The shared drive's images folder is
-# missing most survey pages (35 of 319), so don't point this back at it.
-DATA = Path.home() / "Desktop" / "BuckyBookworm" / "data"
-IMAGES = DATA / "images"
-LABELS = DATA / "train.csv"
-# Results go to the team's shared drive. score_churro.py reads from the same
-# folder, so change both if this moves.
-DRIVE = Path(r"G:\Shared drives\Badger Scribe")
+# Everything comes from and goes to the team's shared drive, so anyone with
+# Google Drive for Desktop can run this without a local copy of the data.
+# score_churro.py reads OUT too, so change both if this moves.
+# Google Drive for Desktop usually mounts as G:, but not always; a teammate
+# with a different letter can set BADGER_DRIVE to their folder instead.
+DRIVE = Path(os.environ.get("BADGER_DRIVE", r"G:\Shared drives\Badger Scribe"))
+IMAGES = DRIVE / "images"
+LABELS = DRIVE / "train.csv"
 OUT = DRIVE / "output data"
+
+# The Kaggle download has 319 survey pages (288 train + 31 test). As of
+# 2026-09-30 the drive's images folder holds only 35 of them and none of the
+# test ones, so check_images() warns until the rest are uploaded.
+EXPECTED = {"dominy": 72, "kade": 436, "survey": 319}
 
 CATEGORY = {"dominy": "dominy_accounts", "kade": "kade_letters", "survey": "survey_notes"}
 
@@ -223,7 +228,23 @@ def eval_pages():
         rng.shuffle(pool)
         pool.sort(key=lambda r: r["label_source"] != "human")  # stable: human first
         picked += [IMAGES / f"{r['page_id']}.jpg" for r in pool[:EVAL_PER_CATEGORY]]
-    return picked
+    # Keep the same fixed picks, but skip any the drive doesn't have yet.
+    missing = [p for p in picked if not p.exists()]
+    if missing:
+        print(f"Skipping {len(missing)} eval pages not on the drive yet: "
+              f"{', '.join(p.stem for p in missing)}")
+    return [p for p in picked if p.exists()]
+
+
+def check_images(images):
+    counts = {c: sum(p.stem.startswith(c + "_") for p in images) for c in EXPECTED}
+    short = {c: n for c, n in counts.items() if n < EXPECTED[c]}
+    print("Images on the drive: " + ", ".join(f"{c} {n}/{EXPECTED[c]}" for c, n in counts.items()))
+    if short:
+        # Each category is a third of the score, and a missing page counts
+        # as a blank answer (CER 1.0).
+        print(f"WARNING: missing pages for {', '.join(short)}. A submission from "
+              "this run will score those pages as blank until they're uploaded.")
 
 
 # True: overwrite old results. False: skip images that already have a .txt
@@ -237,6 +258,7 @@ def main():
                          "and signed in to the account that has the shared drive?")
     OUT.mkdir(parents=True, exist_ok=True)
     all_images = sorted(IMAGES.glob("*.jpg"))
+    check_images(all_images)
     answer = input("Type 'eval' to test on labeled train pages from every category,\n"
                    "or how many images to transcribe (a number, or 'all'): ").strip().lower()
     while not (answer.isdigit() or answer in ("all", "eval")):
