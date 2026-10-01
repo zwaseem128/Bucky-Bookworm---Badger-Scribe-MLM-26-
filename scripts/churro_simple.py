@@ -2,9 +2,13 @@
 Send images from the Badger Scribe shared drive to CHURRO-3b, one at a time.
 
 Run it and answer the question:
-  eval    transcribe the same 36 labeled train pages every time (12 per
-          category), then run score_churro.py to see the macro CER
-  5, all  transcribe that many images (or all of them) for a submission
+  eval    transcribe a fixed mix of labeled train pages from all three
+          categories, then run score_churro.py to see the macro CER
+  Enter   pick a first and last image, each by number (0 is the first in
+          the sorted folder) or by name (kade_012_p001), both included,
+          to split the work across teammates or pick up
+          where an earlier run stopped. Results for those pages replace
+          any older .txt files with the same name.
 
 Each transcription is saved to "output data"/<image>.txt in the Badger
 Scribe shared drive (G:/Shared drives/Badger Scribe), so the team sees it.
@@ -21,6 +25,7 @@ import csv
 import getpass
 import io
 import os
+import random
 import re
 import time
 from pathlib import Path
@@ -35,11 +40,8 @@ from PIL import Image
 # with a different letter can set BADGER_DRIVE to their folder instead.
 DRIVE = Path(os.environ.get("BADGER_DRIVE", r"G:\Shared drives\Badger Scribe"))
 IMAGES = DRIVE / "images"
+LABELS = DRIVE / "train.csv"
 OUT = DRIVE / "output data"
-# Eval mode writes the pages it just transcribed here, so score_churro.py
-# scores those and nothing else. A .csv, not a .txt: every .txt in OUT is
-# read as a page transcription.
-EVAL_LIST = OUT / "last_eval_pages.csv"
 
 # The Kaggle download has 319 survey pages (288 train + 31 test). As of
 # 2026-09-30 the drive's images folder holds only 35 of them and none of the
@@ -215,31 +217,21 @@ def transcribe(client, path):
 
 # ---------------------------------------------------------------- choosing images
 
-# Eval mode transcribes these pages: 12 labeled train pages per category,
-# human-labeled pages first. They were picked once (seed 0, from the 619-page
-# train.csv of 2026-09-30) and written down here, instead of re-picked from
-# train.csv on every run. train.csv grows during the competition, and
-# re-picking would quietly swap in different pages, so scores from different
-# weeks couldn't be compared. Change this list only if the team agrees, and
-# re-score the baseline when you do.
-EVAL_PAGES = (
-    # dominy_accounts: only 2 human-labeled pages exist, the rest are silver
-    "dominy_002_p002", "dominy_020_p002", "dominy_001_p002", "dominy_017_p003",
-    "dominy_015_p002", "dominy_018_p003", "dominy_018_p004", "dominy_016_p003",
-    "dominy_034_p003", "dominy_029_p004", "dominy_008_p004", "dominy_008_p002",
-    # kade_letters: all human-labeled
-    "kade_007_p064", "kade_103_p178", "kade_128_p039", "kade_103_p100",
-    "kade_128_p020", "kade_128_p131", "kade_128_p136", "kade_128_p079",
-    "kade_103_p053", "kade_128_p034", "kade_128_p137", "kade_128_p056",
-    # survey_notes: all human-labeled
-    "survey_002_p0006", "survey_002_p0005", "survey_007_p0011", "survey_006_p0007",
-    "survey_011_p0007", "survey_007_p0012", "survey_003_p0005", "survey_001_p0002",
-    "survey_009_p0012", "survey_011_p0008", "survey_010_p0008", "survey_004_p0006",
-)
+# Eval mode: this many labeled train pages per category, human-labeled pages
+# first. The same pages every time (fixed seed), so runs are comparable.
+EVAL_PER_CATEGORY = 12
+EVAL_SEED = 0
 
 
 def eval_pages():
-    picked = [IMAGES / f"{page_id}.jpg" for page_id in EVAL_PAGES]
+    rows = list(csv.DictReader(open(LABELS, encoding="utf-8-sig", newline="")))
+    rng = random.Random(EVAL_SEED)
+    picked = []
+    for cat in sorted({r["category"] for r in rows}):
+        pool = [r for r in rows if r["category"] == cat]
+        rng.shuffle(pool)
+        pool.sort(key=lambda r: r["label_source"] != "human")  # stable: human first
+        picked += [IMAGES / f"{r['page_id']}.jpg" for r in pool[:EVAL_PER_CATEGORY]]
     # Keep the same fixed picks, but skip any the drive doesn't have yet.
     missing = [p for p in picked if not p.exists()]
     if missing:
@@ -264,6 +256,44 @@ def check_images(images):
 START_OVER = True
 
 
+def ask_image(question, images, default):
+    """Ask for one image by its number or its name; return its position.
+
+    A number is the position in the sorted list (0 is the first image). A name
+    is the file name with or without .jpg, e.g. kade_012_p001. Enter gives
+    default. Any image in the folder is allowed.
+    """
+    names = {p.stem.lower(): i for i, p in enumerate(images)}
+    high = len(images) - 1
+    while True:
+        answer = input(f"{question} (number 0-{high} or an image name, "
+                       f"Enter for {images[default].stem}): ").strip()
+        if not answer:
+            return default
+        key = answer.lower().removesuffix(".jpg")
+        if key.isdigit() and int(key) <= high:
+            return int(key)
+        if key in names:
+            return names[key]
+        print(f"Please type a number from 0 to {high}, or the name of an image in {IMAGES}.")
+
+
+def ask_range(images):
+    """Return (first, last) so that images[first:last + 1] is the chosen range.
+
+    Both ends are included, so picking the same image twice runs just that one.
+    The two ends can be typed in either order.
+    """
+    print(f"There are {len(images)} images, numbered 0 to {len(images) - 1} "
+          f"({images[0].stem} to {images[-1].stem}).")
+    first = ask_image("First image", images, 0)
+    last = ask_image("Last image", images, len(images) - 1)
+    if last < first:
+        print( f"Running {last} to {first}, since {images[last].stem} comes first in the folder.")
+        first, last = last, first
+    return first, last
+
+
 def main():
     if not DRIVE.exists():
         raise SystemExit(f"Can't find {DRIVE}. Is Google Drive for Desktop running "
@@ -272,16 +302,21 @@ def main():
     all_images = sorted(IMAGES.glob("*.jpg"))
     check_images(all_images)
     answer = input("Type 'eval' to test on labeled train pages from every category,\n"
-                   "or how many images to transcribe (a number, or 'all'): ").strip().lower()
-    while not (answer.isdigit() or answer in ("all", "eval")):
-        answer = input("Please type eval, a number like 5, or all: ").strip().lower()
+                   "or press Enter to pick a range of images: ").strip().lower()
+    while answer not in ("", "eval"):
+        answer = input("Please type eval, or press Enter for a range: ").strip().lower()
 
-    todo = eval_pages() if answer == "eval" else all_images
-    eval_set = list(todo) if answer == "eval" else []
+    if answer == "eval":
+        todo = eval_pages()
+    else:
+        first, last = ask_range(all_images)
+        # Slice before the START_OVER filter so a number always means the same
+        # image in the sorted list, however many pages are already done.
+        todo = all_images[first:last + 1]
+        print(f"Images {first} to {last}: {todo[0].name} through {todo[-1].name}. "
+              f"Results go to {OUT}, replacing any with the same name.")
     if not START_OVER:
         todo = [p for p in todo if not (OUT / f"{p.stem}.txt").exists()]
-    if answer.isdigit():
-        todo = todo[:int(answer)]
     print(f"{len(todo)} images to transcribe.")
 
     key = os.environ.get("CHURRO_API_KEY") or getpass.getpass("UW gateway API key: ")
@@ -307,25 +342,12 @@ def main():
             writer.writerow([txt.stem, txt.stem.split("_")[0],
                              txt.read_text(encoding="utf-8")])
 
-    if answer == "eval":
-        # Tell score_churro.py which pages this run produced. A page whose
-        # requests failed is left out, even if an older .txt for it is still
-        # in the folder, so a stale answer from an earlier prompt can't sneak
-        # into the score. Pages skipped because START_OVER is False are kept.
-        done = [p.stem for p in eval_set
-                if p.name not in failed and (OUT / f"{p.stem}.txt").exists()]
-        with open(EVAL_LIST, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["page_id"])
-            writer.writerows([page_id] for page_id in done)
-
     print(f"Done. All results are in {OUT / 'transcriptions.csv'}")
     if failed:
         print(f"{len(failed)} pages got no answer because the requests failed: "
               f"{', '.join(failed)}\nSet START_OVER = False and run again to fill them in.")
     if answer == "eval":
-        print(f"Now run score_churro.py to see the CER for each category "
-              f"({len(done)} eval pages to score).")
+        print("Now run score_churro.py to see the CER for each category.")
 
 
 if __name__ == "__main__":
