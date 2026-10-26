@@ -2,8 +2,9 @@
 
 This note explains, without assuming a technical background, how we teach a handwriting model to
 read the Kade letters better, and how we run that on AWS SageMaker. It goes with
-`notebooks/sagemaker_kade_lora.ipynb` (the notebook you run) and `sagemaker/code/` (the code the
-notebook sends to AWS).
+`notebooks/kade_lora_in_notebook.ipynb` (train in the Jupyter window),
+`notebooks/sagemaker_kade_lora.ipynb` (train as a SageMaker job) and `sagemaker/code/` (the
+training code both of them run).
 
 ## The problem
 
@@ -107,6 +108,20 @@ Inside the job, the script:
 
 The notebook then downloads that file and shows you the before and after scores.
 
+### Or: train inside the Jupyter window
+
+`notebooks/kade_lora_in_notebook.ipynb` skips the training job: it runs the same script on the
+notebook instance's own GPU, and the training log appears right below the cell. That is simpler
+to follow, but two things change:
+
+- **The notebook instance itself needs a GPU** (`ml.g4dn.xlarge` or `ml.g5.xlarge`) and a
+  **50 GB** volume, chosen when you create the instance.
+- **It bills every hour the instance is running, training or not, even with the browser
+  closed.** Stop the instance the moment you're done. A training job can't be forgotten that way,
+  because it shuts itself down.
+
+Both notebooks run the same script with the same settings, so their scores are comparable.
+
 **Checkpoints:** at the end of every epoch the job saves its progress to your bucket. If the job
 is stopped partway, a new job pointed at the same checkpoint folder picks up from there instead
 of starting over.
@@ -169,8 +184,9 @@ Two cautions:
 
 1. Cut the pages into lines on Ubuntu (`docs/ubuntu-setup.md`, then the segmentation notebook),
    with `LIMIT = None`. Zip the result.
-2. In SageMaker, open `notebooks/sagemaker_kade_lora.ipynb` and run it with `RUN = "smoke"`: a
-   tiny run (under a dollar) that proves everything works.
+2. In SageMaker, open `notebooks/kade_lora_in_notebook.ipynb` (training in the Jupyter window)
+   or `notebooks/sagemaker_kade_lora.ipynb` (training as a job), and run it with
+   `RUN = "smoke"`: a tiny run (under a dollar) that proves everything works.
 3. `RUN = "baseline"`: the Bern adapter's score, no training.
 4. `RUN = "full"`: the real fine-tune. Roughly 45 minutes and about $1 on g5 (an estimate until
    the smoke test gives a real number).
