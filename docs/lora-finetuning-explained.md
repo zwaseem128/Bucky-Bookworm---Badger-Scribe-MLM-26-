@@ -1,6 +1,6 @@
 # Fine-tuning for the Kade letters, explained
 
-This note explains, without assuming a technical background, how we teach a handwriting model to
+This note explains how we teach a handwriting model to
 read the Kade letters better, and how we run that on AWS SageMaker. It goes with
 `notebooks/kade_lora_in_notebook.ipynb` (train in the Jupyter window),
 `notebooks/sagemaker_kade_lora.ipynb` (train as a SageMaker job) and `sagemaker/code/` (the
