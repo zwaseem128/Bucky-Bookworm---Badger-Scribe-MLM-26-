@@ -4,7 +4,7 @@ This note explains how we teach a handwriting model to
 read the Kade letters better, and how we run that on AWS SageMaker. It goes with
 `notebooks/kade_lora_in_notebook.ipynb` (train in the Jupyter window),
 `notebooks/sagemaker_kade_lora.ipynb` (train as a SageMaker job) and `sagemaker/code/` (the
-training code both of them run).
+training code both of them run). What we found goes in `docs/kade-lora-results.md`.
 
 ## The problem
 
@@ -72,14 +72,41 @@ Two clean-up rules for the labels:
 - **Spelling is never corrected.** The labels keep Anna's spelling exactly, and so should the
   model.
 
-## How we know if it worked: the dev set
+## How we know if it worked: the held-out documents
 
-We keep 11 Kade pages aside that the model never trains on: all of document `kade_112`, the
-team's agreed dev set (`docs/dev-set.md` on Lokesh's branch). After every round of training, the
-model reads those 11 pages and we compute the CER, the same way Kaggle does. Lower is better.
+The most important fact about the Kade test pages is that **every one of them comes from a
+document the training data doesn't contain**. The test letters are from `kade_042`, `kade_058`,
+`kade_138`, `kade_037` and `kade_009`; the training letters are from four other documents. So the
+question that matters isn't "can the model read pages like the ones it trained on?" but "can it
+read letters it has never seen?"
 
-The score is computed **before** any training too ("epoch 0"). That's the Bern adapter as it is,
-and it's the number our training has to beat.
+To answer that honestly, we keep two whole documents out of training and use them only for
+scoring:
+
+- **`kade_112`**, the team's agreed dev set (`docs/dev-set.md` on Lokesh's branch). It is only 11
+  pages, and they are small, faint postcards, so on its own it can't tell us much.
+- **`kade_007`**, 77 full-size pages. This is the main check, and the closest thing we have to a
+  preview of the leaderboard.
+
+After every round of training the model reads all of these pages and we compute the CER, the same
+way Kaggle does. Lower is better. The score is computed **before** any training too ("epoch 0").
+That is the Bern adapter as it is, and it's the number our training has to beat.
+
+Holding out `kade_007` costs us about a quarter of the training lines while we experiment. That's
+a fair price for a number we can believe. For the model we actually submit (the `final` run), we
+put `kade_007` back into training.
+
+### Two scores for every page
+
+About a quarter of the Kade labels end with a line like `Postmark June 14, 1932`. The postmark is
+on the back of the card, so it isn't in the picture and no model can read it. Kaggle still counts
+it, which costs those pages a few points no matter how well the model reads.
+
+So every page gets two scores:
+
+- **CER**, scored exactly the way Kaggle scores it. This is the one to compare with other teams.
+- **Reading CER**, scored against the label without its postmark line. This one shows how well
+  the model reads what is actually in the picture.
 
 ## What happens on AWS
 
@@ -101,12 +128,15 @@ Inside the job, the script:
 1. Installs the right library versions (`requirements.txt`).
 2. Downloads Qwen3-VL-4B and the Bern adapter, and merges them.
 3. Adds our new, empty adapter.
-4. Reads the 11 dev pages and records the score (epoch 0).
-5. Trains, reading every training line once per **epoch**. After each epoch it reads the dev
+4. Reads the held-out pages and records the score (epoch 0).
+5. Trains, reading every training line once per **epoch**. After each epoch it reads the held-out
    pages again and keeps the adapter from whichever epoch scored best.
-6. Saves the best adapter, the scores, and a summary to `model.tar.gz` in your bucket.
+6. For the `baseline` and `final` runs, reads the 141 Kade test pages with the kept adapter and
+   writes them to `kade_test_predictions.csv`.
+7. Saves the adapter, the scores, the predictions and a summary to `model.tar.gz` in your bucket.
 
-The notebook then downloads that file and shows you the before and after scores.
+The notebook then downloads that file, shows you the before and after scores, and builds a Kaggle
+submission when there are predictions to put in one.
 
 ### Or: train inside the Jupyter window
 
@@ -153,45 +183,62 @@ you know which change made the difference.
 | `lora_dropout` | 0.05 | Randomly ignores a few of the adapter's numbers each step, so it can't just memorise. | Training loss falls fast but the dev score doesn't improve → 0.1. |
 | `batch_size` × `grad_accum` | 4 × 4 = 16 | How many lines the model sees before each nudge. 16 is what Bern used. | Rarely. If the job runs out of memory, halve `batch_size` and double `grad_accum`. |
 | `min_pixels` | 65536 | The smallest picture size the model works with. The Kade postcards are small and faint, so a bigger value means more detail. | Try 131072 once the other settings are settled. It makes training slower. |
+| `seed` | 42 | Decides the random parts of training, like the order the lines are shown in. | Only for the `repeat` run, which changes nothing else, to see how much the score moves by chance. |
 
 Things **not** to change: the prompt (Bern's adapter only knows its exact wording) and which
-pages are in the dev set (or scores stop being comparable).
+documents are held out (`kade_112` and `kade_007`), or scores stop being comparable from one run
+to the next.
 
 ## How to read the results
 
-The notebook prints, for each epoch, the dev CER:
+The notebook prints the CER after every epoch, for each held-out document and for all of them
+together:
 
 ```
- epoch  dev_cer
-     0   0.21     <- the Bern adapter as it is (made-up numbers for illustration)
-     1   0.15
-     2   0.13     <- best: this adapter is the one that's saved
-     3   0.14     <- slightly worse: it started memorising the training letters
+ epoch  dev_cer  reading_cer
+     0   0.21     0.19     <- the Bern adapter as it is (made-up numbers for illustration)
+     1   0.15     0.13
+     2   0.13     0.11     <- best: this adapter is the one that's kept
+     3   0.14     0.12     <- slightly worse: it started memorising the training letters
 ```
 
-Then each dev page's score before and after, and the text of the page that improved most, so you
-can see what changed.
+Below that comes a short report. It shows the before and after scores for each document, then the
+average drop in CER with a **95% interval** around it, then how many pages got better and how many
+got worse. Last comes the page that improved most, printed three ways (the label, the reading
+before training, and the reading after), so you can see with your own eyes what changed.
 
-Two cautions:
+The 95% interval is the part that makes a result believable. To get it, the notebook pretends to
+re-pick the scored pages thousands of times at random and watches how much the average drop moves.
+If the whole interval is above zero, the improvement is very unlikely to be a fluke of which pages
+we happened to score. If the interval includes zero, we can't yet tell the run apart from no
+training at all.
 
-- **Small differences may be luck.** 11 pages is a small test. Before believing that a change
-  helped by 0.01 or 0.02, run the same settings twice and see how much the score moves on its own.
-- **The dev set is one writer.** `kade_112` is postcards in pencil from one writer, and smaller
-  images than the rest. A setting that helps there should still be checked on the Kaggle
-  leaderboard.
+Two cautions remain:
+
+- **Small differences between settings may still be luck.** That is what the `repeat` run is
+  for: it trains again with only the random seed changed. If a new setting beats `full` by less
+  than `full` and `repeat` differ from each other, it hasn't really been shown to help.
+- **Everything is one writer.** All the Kade letters, training and test, are Anna Seifert's, so
+  this is fine-tuning for one person's handwriting. That's the right thing to do for this
+  competition, but it's worth saying when we present the results.
 
 ## Order of work
 
 1. Cut the pages into lines on Ubuntu (`docs/ubuntu-setup.md`, then the segmentation notebook),
-   with `LIMIT = None`. Zip the result.
+   with `LIMIT = None`. This cuts the test pages too, since they're read the same way. Zip the
+   result.
 2. In SageMaker, open `notebooks/kade_lora_in_notebook.ipynb` (training in the Jupyter window)
    or `notebooks/sagemaker_kade_lora.ipynb` (training as a job), and run it with
    `RUN = "smoke"`: a tiny run (under a dollar) that proves everything works.
-3. `RUN = "baseline"`: the Bern adapter's score, no training.
-4. `RUN = "full"`: the real fine-tune. Roughly 45 minutes and about $1 on g5 (an estimate until
-   the smoke test gives a real number).
-5. Change one setting, run again, compare. Write each run's settings and score in the team's
-   results table.
+3. `RUN = "baseline"`: the Bern adapter's score with no training, plus a Kaggle submission made
+   from it. That submission gives us the leaderboard number to beat.
+4. `RUN = "full"`: the real fine-tune. Roughly 45 to 60 minutes and about $1.50 on g5 (an
+   estimate until the smoke test gives a real number).
+5. `RUN = "repeat"` and `RUN = "no_kurrent"`: how much the score moves by chance, and whether
+   the Bern adapter is pulling its weight.
+6. Change one setting at a time, run again, and compare against `full` and `repeat`.
+7. `RUN = "final"`: the best settings, trained on `kade_007` as well, with `epochs` set to the
+   best epoch you found. It reads the test pages and the notebook builds `submission.csv`.
 
-Turning the trained adapter into Kaggle predictions for the test pages is the next step after
-this, and isn't in the notebook yet.
+Write every run into `docs/kade-lora-results.md`; the notebook prints the line to paste. That
+page also explains how to turn the runs into an update for ML+X.

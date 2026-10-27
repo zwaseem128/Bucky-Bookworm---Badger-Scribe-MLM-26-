@@ -39,6 +39,14 @@ def label_lines(text: str) -> list:
             if l.strip() and not l.strip().startswith("Postmark")]
 
 
+def strip_postmark(text: str) -> str:
+    """The label without its 'Postmark ...' line. Scoring against this gives
+    the 'reading' CER: how well the model reads what is actually on the card,
+    without the few points every page with a postmark loses for a line the
+    model can't see."""
+    return "\n".join(l for l in str(text).splitlines() if not l.strip().startswith("Postmark"))
+
+
 def user_messages(prompt: str = PROMPT):
     """The user turn in the chat format Qwen-VL expects: an image placeholder
     (the processor swaps in the image tokens) followed by the prompt."""
