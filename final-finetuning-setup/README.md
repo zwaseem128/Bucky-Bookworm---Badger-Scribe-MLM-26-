@@ -116,7 +116,10 @@ explains itself in the notebook; here's the overview.
 2. **Install kraken.** kraken gets its own separate Python environment, because it needs a
    different version of PyTorch than training does. About 3 minutes the first time; after
    that it's already there.
-3. **Download** the Kade page images and the page lists from the class bucket.
+3. **Download** the Kade page images and the page lists from S3. By default it looks in the
+   class bucket; if the data is somewhere else, you tell it where in the cell's first two lines
+   (see "Where the data comes from" below). If it can't find the files, it searches the bucket
+   and tells you where they are.
 4. **Cut the pages into lines.** Try 5 pages first (`LIMIT = 5`), check them, then set
    `LIMIT = None` for all 436, which takes about 45 minutes. If it stops, just run the cell again:
    finished pages are skipped.
@@ -155,6 +158,51 @@ explains itself in the notebook; here's the overview.
 
 These predictions cover the Kade pages only. If the team's Kaggle file also has the other kinds
 of pages, replace just its Kade rows with these.
+
+## Where the data comes from
+
+Notebook 1 copies the data from an S3 bucket. It needs one folder holding:
+
+```
+<folder>/train.csv
+<folder>/test.csv
+<folder>/images/kade_007_p005.jpg, kade_007_p006.jpg, ...   (one image per page)
+```
+
+**The class bucket.** The defaults are `ml-marathon-shared` and the folder `badger-scribe`,
+where the SageMaker lesson keeps the Kade data. If Step 3 stops with "There is no
+badger-scribe/train.csv", the data isn't there (yet) in your account. Two possibilities:
+
+- **It's under a different folder.** Step 3 then prints where it found `train.csv`. Type that
+  folder into `DATA_PREFIX` and run the cell again.
+- **It isn't in the bucket at all.** Step 3 says so. Ask the class organisers whether they've
+  put it there, or upload it to your own bucket as below.
+
+**Your own bucket.** This works the same on Mac and Windows, since it's all in the browser:
+
+1. Get the competition data from Kaggle (the competition's **Data** tab → **Download All**) and
+   unzip it on your computer. You need `train.csv`, `test.csv` and the `images` folder. The other
+   files aren't used.
+2. In the AWS console, open **S3**, click your bucket, and **Create folder** called
+   `badger-scribe`. Open it.
+3. Click **Upload**. Drag in `train.csv` and `test.csv`, then click **Add folder** and choose the
+   `images` folder. Click **Upload** and wait for it to finish.
+   (Only the `kade_` images are used, so to save time you can upload just those: make a new
+   `images` folder on your computer and copy only the files starting with `kade_` into it.)
+4. In Notebook 1, Step 3, set:
+
+   ```python
+   DATA_BUCKET = "your-bucket-name"
+   DATA_PREFIX = "badger-scribe"
+   ```
+
+One person doing this is enough. Teammates use the same two lines, as long as their notebook can
+read that bucket. If Step 3 says it "isn't allowed to read" it, the bucket's owner adds the
+teammate's role to the bucket policy, the same way the SageMaker lesson's S3 episode sets up
+your own bucket.
+
+Notebook 1 only downloads the Kade pages, so a full Kaggle download with the survey and
+account-book pages in it works too.
 
 ## The settings you can change
 
@@ -215,7 +263,9 @@ the type, save, and start it again. Your files stay.
 |---|---|
 | `No GPU` in Notebook 2 or 3 | The instance type has no GPU. Stop it, **Edit** it to `ml.g4dn.xlarge` or `ml.g5.xlarge`, start it. |
 | `No module named 'transformers'`, or an error naming `Qwen3VL` | Step 1 of the notebook didn't run, or ran after other cells. Kernel → Restart Kernel, then run from Step 1. |
-| `Access Denied` when downloading from the class bucket | The instance's IAM role can't read `ml-marathon-shared`. Ask the class organisers, or ask a teammate to share their line images (Notebook 1, Step 7). |
+| Notebook 1, Step 3: "There is no badger-scribe/train.csv" (an error with 404 or Not Found) | The data isn't at that place in the bucket. Read the rest of the message: it says where `train.csv` is, or that it isn't in the bucket at all. See "Where the data comes from". |
+| Notebook 1, Step 3: "isn't allowed to read" (an error with 403 or Access Denied) | The instance's IAM role can't read that bucket. Ask the class organisers, put the data in your own bucket ("Where the data comes from"), or ask a teammate to share their line images (Notebook 1, Step 7). |
+| Notebook 1, Step 3: "images aren't at ..." | `train.csv` was found but the images are in a different folder. The message shows where one of them is; move the images into `images/` next to `train.csv`. |
 | `No space left on device` | The volume is too small. Stop the instance, **Edit** it, raise the volume size to 50 GB, start it. |
 | `CUDA out of memory` | Halve `batch_size` and double `grad_accum` in Notebook 2, Step 4. |
 | `loss` shows `nan` | Happens occasionally on a g4dn. Switch the instance to `ml.g5.xlarge`. |
