@@ -9,10 +9,14 @@ It takes about 15 minutes, most of it copying images. You need Ubuntu 22.04 or n
 of free disk, and to have been added to the **Badger Scribe** shared drive with your @wisc.edu
 account. Type each command into a terminal (Ctrl+Alt+T) and press Enter.
 
-If your Ubuntu runs inside Windows (WSL), follow the same steps, except step 4: use the WSL
-box at the end of that step.
+If your Ubuntu runs inside Windows (WSL), follow the same steps, except: skip step 1, and in
+step 4 use the WSL box at the end of that step. Type every command into the **Ubuntu** app
+(Start menu → Ubuntu), not PowerShell or Git Bash. Its prompt looks like `you@PC:~$`. If you see
+`sudo: command not found` or `source: command not found`, you're in the wrong terminal.
 
 ## 1. Install the tools Ubuntu needs
+
+WSL: skip this step. Ubuntu on WSL already has curl and git, and rclone is only needed outside WSL.
 
 ```
 sudo apt update
@@ -104,18 +108,19 @@ only copies what's new.
 The data stays in `~/badger-scribe-data`, outside the repo: the Kaggle data doesn't go on GitHub.
 
 > **Ubuntu inside Windows (WSL):** skip rclone. Your Windows Google Drive for Desktop already has
-> the files. Make the G: drive visible to Ubuntu, then copy from it:
+> the files, and Ubuntu can ask Windows to copy them over. Run this in the Ubuntu terminal (no
+> `sudo` or password needed):
 >
 > ```
-> sudo mkdir -p /mnt/g
-> sudo mount -t drvfs G: /mnt/g
 > mkdir -p ~/badger-scribe-data/images
-> cp "/mnt/g/Shared drives/Badger Scribe/train.csv" ~/badger-scribe-data/
-> cp "/mnt/g/Shared drives/Badger Scribe/images/"kade_* ~/badger-scribe-data/images/
+> DATA=$(wslpath -w ~/badger-scribe-data)
+> powershell.exe -NoProfile -Command "Copy-Item 'G:\Shared drives\Badger Scribe\train.csv' '$DATA'; Copy-Item 'G:\Shared drives\Badger Scribe\images\kade_*' '$DATA\images'"
 > ```
 >
-> If your Google Drive letter isn't G:, change both `G:` and `/mnt/g`. The mount goes away when
-> WSL restarts; run the `mount` line again if you need it.
+> It takes a minute or two and prints nothing when it works. Check with
+> `ls ~/badger-scribe-data/images | wc -l`, which should print 436. If your Google Drive letter
+> isn't G:, change both `G:`s in the last line. (`wslpath -w` turns the Ubuntu folder into a path
+> Windows understands, like `\\wsl.localhost\Ubuntu\home\you\badger-scribe-data`.)
 
 ## 5. Tell the scripts where the data is
 
@@ -133,9 +138,12 @@ source ~/.bashrc
 cd ~
 git clone https://github.com/zwaseem128/Bucky-Bookworm---Badger-Scribe-MLM-26-.git badger-scribe
 cd badger-scribe
+git checkout lokesh/fine-tuning-setup
 ```
 
-(Skip the clone if you have it already; `git pull` instead.)
+The notebooks live on the `lokesh/fine-tuning-setup` branch, not `main`, so the `checkout` line
+matters: without it there is no `notebooks/` folder. (Skip the clone if you have it already; run
+`git checkout lokesh/fine-tuning-setup` and then `git pull` instead.)
 
 Then, every time you want to work:
 
@@ -155,6 +163,8 @@ To stop Jupyter, press Ctrl+C twice in the terminal.
 
 | Problem | Fix |
 |---|---|
+| `sudo: command not found` (or `source`, `apt`) | You typed into PowerShell or Git Bash. Open the **Ubuntu** app and run it there. On WSL you can skip step 1 entirely. |
+| No `notebooks/` folder, or the notebook isn't there | You're on `main`. Run `git checkout lokesh/fine-tuning-setup` in `~/badger-scribe`. |
 | `uv: command not found` | Run `source $HOME/.local/bin/env`, or open a new terminal. |
 | `ModuleNotFoundError: No module named 'kraken'` in the notebook | The kernel isn't **Badger Scribe**. Change it top right. If it isn't in the list, redo the last line of step 3. |
 | `Can't find .../images` in the notebook | `BADGER_DRIVE` isn't set. Redo step 5, then restart Jupyter. |
