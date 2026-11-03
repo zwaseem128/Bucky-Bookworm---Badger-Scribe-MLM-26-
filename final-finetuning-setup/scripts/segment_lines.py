@@ -63,13 +63,17 @@ def main():
     p.add_argument("--out", required=True, help="folder to write the line positions to")
     p.add_argument("--pattern", default="kade_*.jpg")
     p.add_argument("--limit", type=int, default=0, help="only the first N pages (0 = all)")
+    p.add_argument("--first", default="kade_112",
+                   help="pages whose names start with these (comma-separated) are done first: the dev pages, "
+                        "so any --limit includes them")
     p.add_argument("--workers", type=int, default=os.cpu_count(), help="pages processed side by side")
     p.add_argument("--device", default="cpu")
     args = p.parse_args()
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    pages = sorted(Path(args.images).glob(args.pattern))
+    first = tuple(f.strip() for f in args.first.split(",") if f.strip())
+    pages = sorted(Path(args.images).glob(args.pattern), key=lambda p: (not p.stem.startswith(first), p.stem))
     if args.limit:
         pages = pages[:args.limit]
     todo = [(str(p), str(out)) for p in pages if not (out / f"{p.stem}.json").exists()]
