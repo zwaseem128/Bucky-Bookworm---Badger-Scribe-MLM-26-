@@ -16,6 +16,7 @@ this folder uses is inside it.
 | `1_prepare_lines.ipynb` | Downloads the Kade pages and cuts them into the images the model learns from: single lines, groups of lines, or whole pages. Run it once. |
 | `2_finetune.ipynb` | The training. Run it as many times as you like, with different settings. |
 | `3_transcribe.ipynb` | Uses your best training run to transcribe the test pages for Kaggle. |
+| `4_score_pages.ipynb` | Tests a trained run right away: scores the dev pages (or any pages) with the competition's own scoring code, compares with the model before training, and shows each page's mistakes. |
 | `scripts/` | The code the notebooks run. You don't need to open it. |
 | `requirements-training.txt` | The library versions training needs. Notebooks 2 and 3 install them. |
 
@@ -170,6 +171,27 @@ need to run kraken again.
 
 These predictions cover the Kade pages only. If the team's Kaggle file also has the other kinds
 of pages, replace just its Kade rows with these.
+
+### Notebook 4: `4_score_pages.ipynb` (about 5–15 minutes)
+
+Use it right after Notebook 2 to see how well a run reads, page by page. First free the GPU:
+in Notebook 2, choose **Kernel → Shut Down Kernel**.
+
+1. **Install the libraries** (as in Notebook 2).
+2. **Set up the folders.** It also finds the competition's scoring code, `metric.py`, at the top
+   of the repository, so the scores are calculated exactly the way Kaggle does it.
+3. **Pick a run.** The newest one is picked, so right after training there's nothing to change.
+4. **Load the model**, once (1 to 3 minutes). It stays ready for the rest of the notebook.
+5. **Score pages.** `PAGES = "dev"` (the fair test, on the 11 pages the model never saw),
+   `"train"` (pages it trained on, which look better than they really are), or your own list of
+   page names. With `COMPARE_BEFORE = True` it also reads each page with the model as it was
+   before training, so you see exactly what training changed.
+6. **See the scores**: each page's CER before and after, the mean, and on how many pages training
+   helped.
+7. **Look at one page**: the image, then the text with the model's mistakes coloured in. Type any
+   page name, including a test page, to have the model read it.
+
+Results are saved in `badger-finetune/scores/<run>/`.
 
 ## Where the data comes from
 
