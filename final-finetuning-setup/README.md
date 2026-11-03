@@ -326,6 +326,7 @@ the type, save, and start it again. Your files stay.
 | What you see | What to do |
 |---|---|
 | `No module named 'PIL'` (or `'torch'`, or `'pandas'`) | The notebook is on the wrong kernel, probably `conda_python3`. Choose **Kernel → Change Kernel → conda_pytorch_p310** and run the notebook again from Step 1. (Notebook 1 now installs Pillow and pandas itself if they're missing; Notebooks 2 to 4 tell you if the kernel has no PyTorch.) |
+| `AutoVideoProcessor requires the Torchvision library` | The kernel has PyTorch but not torchvision (this happens on `conda_python3`). Run Step 1 of the notebook again: it now installs the torchvision that matches the kernel's PyTorch. Or switch to `conda_pytorch_p310`, which has it. |
 | `No GPU` in Notebook 2 or 3 | The instance type has no GPU. Stop it, **Edit** it to `ml.g4dn.xlarge` or `ml.g5.xlarge`, start it. |
 | `No module named 'transformers'`, or an error naming `Qwen3VL` | Step 1 of the notebook didn't run, or ran after other cells. Kernel → Restart Kernel, then run from Step 1. |
 | Notebook 1, Step 3: "There is no badger-scribe/train.csv" (an error with 404 or Not Found) | The data isn't at that place in the bucket. Read the rest of the message: it says where `train.csv` is, or that it isn't in the bucket at all. See "Where the data comes from". |
