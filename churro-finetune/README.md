@@ -97,8 +97,21 @@ cd ~/SageMaker
 git clone -b lokesh/fine-tune-churro https://github.com/zwaseem128/Bucky-Bookworm---Badger-Scribe-MLM-26-.git churro
 ```
 
-Then open `churro/churro-finetune/` in the file browser. To get updates later:
-`cd ~/SageMaker/churro && git pull`.
+Then open `churro/churro-finetune/` in the file browser.
+
+**To get updates later**, close the notebooks first (choose **Discard** if asked to save), then:
+
+```
+cd ~/SageMaker/churro
+git stash
+git pull
+```
+
+`git stash` is needed because running a notebook saves its outputs into the file, so git sees it
+as changed and won't overwrite it ("Your local changes ... would be overwritten by merge").
+Stashing puts those changes aside instead of deleting them. Nothing you need is lost: your
+bucket name, downloaded pages and runs are all kept in `~/SageMaker/churro-work`, outside the
+repository.
 
 ## Where the data comes from
 
@@ -124,8 +137,9 @@ not `conda_python3`). Run the cells from top to bottom with **Shift + Enter**.
 
 **Notebook 1** (once):
 1. Set up the folders.
-2. Download the pages. Type your bucket name first. If the files aren't where you said, it
-   searches the bucket and tells you where they are.
+2. Download the pages. Type your bucket name the first time; it's remembered after that (outside
+   the repository), and Notebooks 2 and 3 use it to save your runs. If the files aren't where
+   you said, it searches the bucket and tells you where they are.
 3. Prepare the pages. Read the table: every collection should have training, dev and test pages.
    It also says how many survey spreads were cut, and how many labels were split into left and
    right pages (about half split at the right-hand page number; the rest are trained whole).
@@ -199,6 +213,7 @@ closely the model copies the drafting model.
 | Notebook 1: a collection has 0 training pages | `train.csv` is the Kade-only class copy. Use the full competition data. |
 | The red line in Step 4 cuts through writing | The fold wasn't found on that spread. Tell the team which spreads; the cut can be turned off with `prepare_data.build(DATA, "dev_ids.csv", split_spreads=False)`. |
 | Many pages "read twice" in the length check | Their first readings came out empty, far too short or looping. If the second readings don't fix them, look at those pages in Step 7. |
+| `git pull`: "Your local changes ... would be overwritten by merge" | Run `git stash` first, then `git pull` (Part 2). |
 | Want to start a run over | Delete its folder in `~/SageMaker/churro-work/runs/` and run Notebook 2 from Step 4. |
 
 ## Credits
