@@ -110,7 +110,10 @@ To get updates later, run `cd ~/SageMaker/badger-scribe && git pull` in a termin
 ## Part 3: Run the notebooks
 
 Open each notebook by double-clicking it. If JupyterLab asks for a **kernel**, choose
-**conda_pytorch_p310** (or whichever `conda_pytorch` kernel is listed). Run the cells one at a
+**conda_pytorch_p310** (or whichever `conda_pytorch` kernel is listed). **Not** `conda_python3`:
+it has no PyTorch, so it can't run the model. The kernel's name shows in the top-right corner of
+the notebook; to change it, choose **Kernel → Change Kernel**. Step 1 of each notebook also prints
+it, as "Kernel environment" (for example `pytorch_p310`). Run the cells one at a
 time, from top to bottom, with **Shift + Enter** (the same on Mac and Windows). Each step
 explains itself in the notebook; here's the overview.
 
@@ -322,6 +325,7 @@ the type, save, and start it again. Your files stay.
 
 | What you see | What to do |
 |---|---|
+| `No module named 'PIL'` (or `'torch'`, or `'pandas'`) | The notebook is on the wrong kernel, probably `conda_python3`. Choose **Kernel → Change Kernel → conda_pytorch_p310** and run the notebook again from Step 1. (Notebook 1 now installs Pillow and pandas itself if they're missing; Notebooks 2 to 4 tell you if the kernel has no PyTorch.) |
 | `No GPU` in Notebook 2 or 3 | The instance type has no GPU. Stop it, **Edit** it to `ml.g4dn.xlarge` or `ml.g5.xlarge`, start it. |
 | `No module named 'transformers'`, or an error naming `Qwen3VL` | Step 1 of the notebook didn't run, or ran after other cells. Kernel → Restart Kernel, then run from Step 1. |
 | Notebook 1, Step 3: "There is no badger-scribe/train.csv" (an error with 404 or Not Found) | The data isn't at that place in the bucket. Read the rest of the message: it says where `train.csv` is, or that it isn't in the bucket at all. See "Where the data comes from". |
