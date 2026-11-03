@@ -194,6 +194,7 @@ closely the model copies the drafting model.
 | `CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED` | The script notices and carries on without cuDNN (a little slower). conda_pytorch_p310 avoids it. |
 | `The training loss became NaN` | fp16 on a T4. Use an `ml.g5.xlarge` or `ml.g6.xlarge` instance. |
 | `CUDA out of memory` | Lower `max_pixels` to `1024 * 28 * 28`, or check no other notebook is using the GPU (Kernel → Shut Down Kernel there). |
+| Notebook 1: "This notebook isn't allowed to read <bucket>" | The bucket can stay private. The message prints a bucket policy naming only this notebook's role: in the S3 console open the bucket → **Permissions** → **Bucket policy** → **Edit**, paste it (or add its statement to the policy already there), **Save changes**, and run the cell again. Only the bucket's owner can do this. |
 | Notebook 1: "There is no badger-scribe/train.csv" | The data isn't at that place in the bucket; the message says where `train.csv` is, or that it isn't there. |
 | Notebook 1: a collection has 0 training pages | `train.csv` is the Kade-only class copy. Use the full competition data. |
 | The red line in Step 4 cuts through writing | The fold wasn't found on that spread. Tell the team which spreads; the cut can be turned off with `prepare_data.build(DATA, "dev_ids.csv", split_spreads=False)`. |
