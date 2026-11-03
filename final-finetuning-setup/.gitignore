@@ -1,0 +1,3 @@
+# Python cache files, and the temporary copy the notebook tests make
+__pycache__/
+_test.ipynb

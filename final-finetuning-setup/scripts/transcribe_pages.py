@@ -20,7 +20,7 @@ import time
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from finetune_qwen_kurrent_lora import load_for_inference, transcribe_lines  # noqa: E402
+from finetune_qwen_kurrent_lora import load_for_inference, read_crop_settings, transcribe_lines  # noqa: E402
 from kurrent_common import BASE_MODEL, START_ADAPTER, load_line_image, page_cer  # noqa: E402
 
 
@@ -32,9 +32,22 @@ def main():
     p.add_argument("--adapter_dir", default=None)
     p.add_argument("--base_model", default=BASE_MODEL)
     p.add_argument("--start_adapter", default=START_ADAPTER)
-    p.add_argument("--batch", type=int, default=16)
-    p.add_argument("--max_new_tokens", type=int, default=128)
+    p.add_argument("--batch", type=int, default=None, help="default: from crop_settings.json")
+    p.add_argument("--max_new_tokens", type=int, default=None, help="default: from crop_settings.json")
     args = p.parse_args()
+
+    # Read the pages the same way the run was trained: same kind of images,
+    # same limits on words out.
+    crop = read_crop_settings(args.lines_dir)
+    args.batch = args.batch or crop["eval_batch"]
+    args.max_new_tokens = args.max_new_tokens or crop["max_new_tokens"]
+    if args.adapter_dir:
+        trained = read_crop_settings(args.adapter_dir)
+        if trained["mode"] != crop["mode"]:
+            raise SystemExit(f"This run was trained on images cut as '{trained['mode']}', but the images "
+                             f"in {args.lines_dir} are cut as '{crop['mode']}'. In Notebook 1, set "
+                             f"CROP = \"{trained['mode']}\" and run Step 6 again, or pick a run trained "
+                             f"on '{crop['mode']}'.")
 
     pages = pd.read_csv(args.pages, keep_default_na=False, encoding="utf-8-sig")
     done = set(pd.read_csv(args.out, keep_default_na=False)["page_id"]) if os.path.exists(args.out) else set()
@@ -43,7 +56,7 @@ def main():
     if todo.empty:
         return
 
-    model, processor = load_for_inference(args.adapter_dir, args.base_model, args.start_adapter)
+    model, processor = load_for_inference(args.adapter_dir, args.base_model, args.start_adapter, crop["max_pixels"])
     has_ref = "text" in pages.columns
     new = not os.path.exists(args.out)
     with open(args.out, "a", newline="", encoding="utf-8") as f:

@@ -13,7 +13,7 @@ this folder uses is inside it.
 
 | File | What it does |
 |---|---|
-| `1_prepare_lines.ipynb` | Downloads the Kade pages and cuts every page into one image per line with kraken. Run it once. |
+| `1_prepare_lines.ipynb` | Downloads the Kade pages and cuts them into the images the model learns from: single lines, groups of lines, or whole pages. Run it once. |
 | `2_finetune.ipynb` | The training. Run it as many times as you like, with different settings. |
 | `3_transcribe.ipynb` | Uses your best training run to transcribe the test pages for Kaggle. |
 | `scripts/` | The code the notebooks run. You don't need to open it. |
@@ -38,9 +38,13 @@ that keeps the original model untouched and trains only a small add-on of its ow
 million numbers, next to the model's 4.4 billion. That's what makes it fit on one affordable
 GPU, and the result is a file of about 130 MB.
 
-The Bern adapter reads **one line at a time**, so first we cut every page into lines with a
-program called **kraken** (Notebook 1). To score the model on a whole page, we read each of
-its lines and put them back together.
+The Bern adapter was trained on **one line at a time**, so by default we cut every page into
+lines first (Notebook 1), using a program called **kraken** to find where each line is. Each line
+image is a strip that follows the slope of the writing and reaches toward the neighbouring lines,
+so dots, umlauts, tall loops and long tails stay in; the neighbouring lines' writing is covered
+with the colour of the paper. You can also cut pages into **groups** of a few lines, or keep
+**whole pages**, uncut (see "How to cut the pages" below). To score the model on a whole page, we
+read each of its images and put the text back together.
 
 We keep 11 pages aside that the model never trains on: letter `kade_112`, the team's **dev
 set**. After every round of training, the model reads those 11 pages and we compute the CER,
@@ -57,7 +61,7 @@ running**, whether or not you're using it, and even with the browser closed.
 | `ml.g5.xlarge` | NVIDIA A10G, 24 GB | $1.41 |
 
 A first full pass (Notebook 1, a smoke test, a baseline, one full training run, and Notebook 3)
-takes about 3 hours on a g4dn, so about $2–3. The real risk is forgetting to stop the
+takes about 6 hours on a g4dn, about half of it kraken finding the lines, so about $4–5. The real risk is forgetting to stop the
 instance: a g5 left on over a weekend is about $70. **Stop the instance every time you're
 done** (see "Stopping and starting").
 
@@ -109,7 +113,7 @@ Open each notebook by double-clicking it. If JupyterLab asks for a **kernel**, c
 time, from top to bottom, with **Shift + Enter** (the same on Mac and Windows). Each step
 explains itself in the notebook; here's the overview.
 
-### Notebook 1: `1_prepare_lines.ipynb` (once, about an hour)
+### Notebook 1: `1_prepare_lines.ipynb` (once, about 3 hours, mostly waiting)
 
 1. **Set up the folders.** Everything goes in `~/SageMaker/badger-finetune`, which survives
    stopping the instance.
@@ -120,15 +124,23 @@ explains itself in the notebook; here's the overview.
    class bucket; if the data is somewhere else, you tell it where in the cell's first two lines
    (see "Where the data comes from" below). If it can't find the files, it searches the bucket
    and tells you where they are.
-4. **Cut the pages into lines.** Try 5 pages first (`LIMIT = 5`), check them, then set
-   `LIMIT = None` for all 436, which takes about 45 minutes. If it stops, just run the cell again:
-   finished pages are skipped.
-5. **Look at the result.** One page next to its line images. Each image should hold exactly
-   one whole line.
-6. **Pair lines with the transcription.** Wherever kraken found as many lines as the
-   transcription has, image 1 goes with line 1, image 2 with line 2, and so on. Other pages are
-   left out of training. Read the first line it prints: we're hoping for 70% of pages or more.
-7. **Save to S3** (optional), so teammates can skip this notebook.
+4. **Choose how to cut the pages**: `CROP = "lines"`, `"groups"` or `"pages"` (see "How to cut
+   the pages" below).
+5. **Find the lines with kraken.** Try 5 pages first (`LIMIT = 5`), check them in Step 7, then set
+   `LIMIT = None` for all 436, which takes about 3 hours on a 4-processor instance. If it stops,
+   just run the cell again: finished pages are skipped. Not needed for `"pages"`.
+6. **Cut the images.** A few minutes. It also puts back together lines that kraken split into
+   pieces.
+7. **Look at the result.** A page with a box around each image, then the images themselves. Check
+   that no dot, loop or tail is cut off.
+8. **Pair the images with the transcription.** For lines and groups, wherever the number of lines
+   matches the transcription, image 1 goes with line 1 (or lines 1 to 3), and so on. Other pages
+   are left out of training. Read the first line it prints: we're hoping for 70% of pages or more.
+   For pages, every page is used.
+9. **Save to S3** (optional), so teammates can skip this notebook.
+
+To try a different way of cutting later, change Step 4 and run Steps 6, 7 and 8 again. There's no
+need to run kraken again.
 
 ### Notebook 2: `2_finetune.ipynb` (each run 10 minutes to 1.5 hours)
 
@@ -204,6 +216,33 @@ your own bucket.
 Notebook 1 only downloads the Kade pages, so a full Kaggle download with the survey and
 account-book pages in it works too.
 
+## How to cut the pages
+
+Set in Notebook 1, Step 4.
+
+| `CROP` | Each image holds | Good | Less good |
+|---|---|---|---|
+| `"lines"` (the default) | one line | What the Kurrent adapter was trained on, so it starts out strongest; many small examples to learn from | Only pages where the line count matches the transcription can be trained on |
+| `"groups"` | `GROUP` lines (3 by default) | Fewer edges, more context: a middle way | Same rule about matching line counts |
+| `"pages"` | the whole page | Nothing is cut, every page is used, no kraken needed | Unlike how the adapter was trained; needs more GPU memory and time; the page is shrunk to fit |
+
+**What we measured on 26 real Kade training pages.** kraken's line count matched the
+transcription on 7 pages as it came. kraken often splits a line with a gap in it into two or
+three pieces; putting those back together, and for training pages trying a few ways of doing so,
+brings it to 20 of 26 (77%). The rest were pages kraken couldn't read as lines (an almost empty
+page, writing turned sideways or in the margins) and stay out of training with `"lines"` and
+`"groups"`. With `"pages"` they're used.
+
+`ABOVE` and `BELOW` set how far each strip reaches toward the lines above and below (0.7 and 0.5 of
+the space between two lines). Raise them if Step 7 shows the tops of tall letters or the tails
+cut off; lower them if you see a lot of the neighbouring lines.
+
+**Which to choose?** Nobody knows yet for these letters; that's what the dev score is for. A good
+plan: run Notebook 2's `"baseline"` for each of the three (no training, about 10 minutes each). It
+shows how well the Kurrent adapter reads each kind of image as it is. Then train on the most
+promising one or two. Each run's name starts with its kind of image, so they never get mixed up,
+and Notebook 3 only offers runs that match the images Notebook 1 cut last.
+
 ## The settings you can change
 
 They're in Notebook 2, Step 4. Change **one at a time**, and write down each run's settings
@@ -212,11 +251,11 @@ and dev score in the team's results table, so you know what made the difference.
 | Setting | Starts at | In plain words | Change it when |
 |---|---|---|---|
 | `lr` (learning rate) | `1e-4` (0.0001) | How big each correction is. Too big, and the model forgets what Bern taught it; too small, and nothing changes. | The dev score gets better and then worse: lower it to `5e-5`. It barely moves: raise it to `2e-4`. |
-| `epochs` | 3 | How many times training goes through all the lines. | The best round is always the last: try 4 or 5. The best is round 1: 2 is enough. |
+| `epochs` | 3 | How many times training goes through all the images. | The best round is always the last: try 4 or 5. The best is round 1: 2 is enough. |
 | `lora_r` | 16 | How big our add-on is, so how much it can change. | Training loss stays high: try 32. The dev score lags behind the training loss: try 8. |
 | `lora_alpha` | 32 | How strongly the add-on acts. Keep it at twice `lora_r`. | Whenever you change `lora_r`. |
 | `lora_dropout` | 0.05 | A little randomness during training, so it can't simply memorise. | Training loss drops fast but the dev score doesn't follow: try 0.1. |
-| `batch_size` and `grad_accum` | 4 and 4 | How many lines it looks at before each correction (4 × 4 = 16). | Only if the GPU runs out of memory: halve `batch_size` and double `grad_accum`. |
+| `batch_size` and `grad_accum` | 4 and 4 | How many images it looks at before each correction (4 × 4 = 16). With `"pages"`, Notebook 2 uses 1 and 16, so a whole page fits in memory. | Only if the GPU runs out of memory: halve `batch_size` and double `grad_accum`. |
 | `min_pixels` | 65536 | The smallest image size the model works with. The Kade postcards are small and faint, so bigger can mean more detail. | Try 131072 once the others are settled. Training gets slower. |
 
 Two things to leave alone: the instruction the model is given (the Bern adapter only knows its
@@ -264,12 +303,14 @@ the type, save, and start it again. Your files stay.
 | `No GPU` in Notebook 2 or 3 | The instance type has no GPU. Stop it, **Edit** it to `ml.g4dn.xlarge` or `ml.g5.xlarge`, start it. |
 | `No module named 'transformers'`, or an error naming `Qwen3VL` | Step 1 of the notebook didn't run, or ran after other cells. Kernel → Restart Kernel, then run from Step 1. |
 | Notebook 1, Step 3: "There is no badger-scribe/train.csv" (an error with 404 or Not Found) | The data isn't at that place in the bucket. Read the rest of the message: it says where `train.csv` is, or that it isn't in the bucket at all. See "Where the data comes from". |
-| Notebook 1, Step 3: "isn't allowed to read" (an error with 403 or Access Denied) | The instance's IAM role can't read that bucket. Ask the class organisers, put the data in your own bucket ("Where the data comes from"), or ask a teammate to share their line images (Notebook 1, Step 7). |
+| Notebook 1, Step 3: "isn't allowed to read" (an error with 403 or Access Denied) | The instance's IAM role can't read that bucket. Ask the class organisers, put the data in your own bucket ("Where the data comes from"), or ask a teammate to share their images (Notebook 1, Step 9). |
 | Notebook 1, Step 3: "images aren't at ..." | `train.csv` was found but the images are in a different folder. The message shows where one of them is; move the images into `images/` next to `train.csv`. |
 | `No space left on device` | The volume is too small. Stop the instance, **Edit** it, raise the volume size to 50 GB, start it. |
 | `CUDA out of memory` | Halve `batch_size` and double `grad_accum` in Notebook 2, Step 4. |
 | `loss` shows `nan` | Happens occasionally on a g4dn. Switch the instance to `ml.g5.xlarge`. |
 | `kraken didn't install` | Run the cell again. If it still fails, delete the `kraken-env` folder in `~/SageMaker/badger-finetune` and run it once more. |
-| Fewer than 70% of training pages usable in Notebook 1 | kraken is struggling with the pages. Look at a few in Step 5 and tell the team before training. |
+| Fewer than 70% of training pages usable in Notebook 1 | kraken is struggling with the pages. Look at a few of the listed pages in Step 7. You can also try `CROP = "pages"`, which uses every page. |
+| Letters cut off at the top or bottom of the line images | Raise `ABOVE` (top) or `BELOW` (bottom) in Notebook 1, Step 4, then run Steps 6 to 8 again. |
+| Notebook 3: "This run was trained on images cut as ..." | The run was trained on a different kind of image than Notebook 1 cut last. Set `CROP` in Notebook 1 back to the run's kind and run Steps 6 and 8 again, or pick another run. |
 | The browser lost connection during training | Training continues. Open `train.log` in the run's folder under `badger-finetune/runs/` to see where it is. |
 | Want to start a run over | Delete its folder in `~/SageMaker/badger-finetune/runs/` and run Notebook 2 from Step 4. Running the same settings again otherwise continues the old run. |

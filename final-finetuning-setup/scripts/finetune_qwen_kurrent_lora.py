@@ -74,12 +74,15 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=4, help="lines per step")
     p.add_argument("--grad_accum", type=int, default=4, help="effective batch = batch_size * grad_accum")
     p.add_argument("--min_pixels", type=int, default=MIN_PIXELS)
-    p.add_argument("--max_pixels", type=int, default=MAX_PIXELS)
+    # Left empty, these three come from kade_lines/crop_settings.json, which
+    # make_crops.py writes to suit how the pages were cut (a whole page needs
+    # far more words out and more image detail than one line).
+    p.add_argument("--max_pixels", type=int, default=None)
     p.add_argument("--max_train_lines", type=int, default=0, help="0 = all; small (e.g. 64) for a smoke test")
     # --- scoring ---
     p.add_argument("--dev_pages", type=int, default=0, help="dev pages scored each epoch; 0 = all")
-    p.add_argument("--eval_batch", type=int, default=16, help="lines transcribed at once while scoring")
-    p.add_argument("--max_new_tokens", type=int, default=128, help="a line is ~40 tokens; this stops loops")
+    p.add_argument("--eval_batch", type=int, default=None, help="images transcribed at once while scoring")
+    p.add_argument("--max_new_tokens", type=int, default=None, help="most words written per image; stops loops")
     p.add_argument("--seed", type=int, default=42)
     # --- SageMaker paths ---
     p.add_argument("--train_dir", type=str, default=os.environ.get("SM_CHANNEL_TRAIN", "/opt/ml/input/data/train"))
@@ -198,14 +201,23 @@ def load_model(args, dtype, device):
     return model, processor
 
 
-def load_for_inference(adapter_dir, base_model=BASE_MODEL, start_adapter=START_ADAPTER):
+def read_crop_settings(lines_dir):
+    """How the images in lines_dir were cut (written by make_crops.py). An older
+    folder of plain line images without the file is treated as lines."""
+    path = os.path.join(lines_dir, "crop_settings.json")
+    if os.path.exists(path):
+        return json.load(open(path))
+    return {"mode": "lines", "max_new_tokens": 128, "max_pixels": MAX_PIXELS, "eval_batch": 16}
+
+
+def load_for_inference(adapter_dir, base_model=BASE_MODEL, start_adapter=START_ADAPTER, max_pixels=MAX_PIXELS):
     """Rebuild a fine-tuned model from the folder training saved (the best
     epoch's adapter plus the image settings it was trained with). With
     adapter_dir=None, just the Kurrent adapter, as it was before training."""
     from peft import PeftModel
     from transformers import AutoProcessor
     args = argparse.Namespace(base_model=base_model, start_adapter=start_adapter,
-                              min_pixels=MIN_PIXELS, max_pixels=MAX_PIXELS)
+                              min_pixels=MIN_PIXELS, max_pixels=max_pixels)
     model, processor = load_model(args, pick_dtype(), "cuda" if torch.cuda.is_available() else "cpu")
     if adapter_dir is None:
         return model.eval(), processor
@@ -227,6 +239,12 @@ def main():
         root = "/tmp/kade_data"   # the channel can be read-only, so unpack elsewhere
         with zipfile.ZipFile(os.path.join(args.train_dir, "lines.zip")) as z:
             z.extractall(root)
+    crop = read_crop_settings(os.path.join(root, "kade_lines"))
+    for key in ("max_pixels", "max_new_tokens", "eval_batch"):
+        if getattr(args, key) is None:
+            setattr(args, key, crop[key])
+    print(f"images cut as '{crop['mode']}': max_pixels {args.max_pixels}, "
+          f"max_new_tokens {args.max_new_tokens}, eval_batch {args.eval_batch}", flush=True)
     train_df = pd.read_csv(os.path.join(args.train_dir, "train_lines.csv"), keep_default_na=False)
     dev_df = pd.read_csv(os.path.join(args.train_dir, "dev_pages.csv"), keep_default_na=False)
     if args.max_train_lines > 0:
@@ -329,6 +347,9 @@ def main():
     shutil.copytree(best_dir, args.model_dir, dirs_exist_ok=True)
     shutil.copytree(args.eval_dir, args.model_dir, dirs_exist_ok=True)
     processor.save_pretrained(args.model_dir)
+    # So Notebook 3 can check it reads pages cut the same way as in training.
+    with open(os.path.join(args.model_dir, "crop_settings.json"), "w") as f:
+        json.dump(crop, f, indent=2)
     best = min(curve, key=lambda c: c["dev_cer"])
     with open(os.path.join(args.model_dir, "train_log.json"), "w") as f:
         json.dump({"loss": loss, "dev_cer_by_epoch": curve}, f, indent=2)
@@ -343,7 +364,9 @@ def main():
         "lora_r": args.lora_r,
         "lora_alpha": args.lora_alpha,
         "effective_batch": args.batch_size * args.grad_accum,
+        "crop_mode": crop["mode"],
         "min_pixels": args.min_pixels,
+        "max_pixels": args.max_pixels,
         "dtype": str(dtype).replace("torch.", ""),
         "train_minutes": round(train_secs / 60, 1),
         "final_loss": final_loss,
