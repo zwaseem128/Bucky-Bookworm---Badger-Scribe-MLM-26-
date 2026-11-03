@@ -183,12 +183,36 @@ def evaluate(model, processor, dev_df, root, args, label):
 
 
 # ---------------------------------------------------------------------------
+def check_cudnn(dtype):
+    """Turn cuDNN off if it doesn't work in this Python environment.
+
+    cuDNN is NVIDIA's library for image layers. Qwen3-VL uses it for one layer
+    only: the first step that cuts each image into patches. When PyTorch is
+    pip-installed into a kernel that wasn't built for it (conda_python3 on a
+    SageMaker notebook), part of cuDNN can fail to load, with errors like
+    CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED. PyTorch can do that one layer
+    without cuDNN, just a little slower, so try it once and switch cuDNN off
+    if it fails.
+    """
+    if not torch.cuda.is_available() or not torch.backends.cudnn.enabled:
+        return
+    try:
+        layer = torch.nn.Conv3d(3, 8, kernel_size=(2, 16, 16), stride=(2, 16, 16)).to("cuda", dtype)
+        layer(torch.randn(4, 3, 2, 16, 16, device="cuda", dtype=dtype))
+        torch.cuda.synchronize()
+    except RuntimeError as e:
+        torch.backends.cudnn.enabled = False
+        print(f"cuDNN doesn't work in this kernel ({str(e).splitlines()[0][:90]}). Carrying on without it, "
+              "which is a little slower. The conda_pytorch_p310 kernel avoids this.", flush=True)
+
+
 def load_model(args, dtype, device):
     """Qwen3-VL-4B with the Kurrent adapter merged in. This is the model the
     new adapter learns on top of, and the model inference needs too."""
     from peft import PeftModel
     from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
+    check_cudnn(dtype)
     print(f"loading {args.base_model} in {dtype}", flush=True)
     model = Qwen3VLForConditionalGeneration.from_pretrained(args.base_model, dtype=dtype, attn_implementation="sdpa").to(device)
     if args.start_adapter.lower() != "none":
