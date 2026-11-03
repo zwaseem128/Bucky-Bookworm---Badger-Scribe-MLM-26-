@@ -1,23 +1,35 @@
-"""LoRA fine-tune of CHURRO-3B on whole Badger Scribe pages, all three collections.
+"""LoRA fine-tune of CHURRO-3B on whole Badger Scribe pages, all three collections,
+tailored to the problems in Lokesh's dev-set audit.
 
-Run by 2_finetune.ipynb on the notebook instance's GPU. Adapted from
-finetune_churro_lora.py in the "ML with AWS SageMaker" lesson
-(carpentries-incubator/ML_with_AWS_SageMaker, MIT licence). Changes:
+Run by 2_finetune.ipynb on the notebook instance's GPU. The training loop is
+adapted from finetune_churro_lora.py in the "ML with AWS SageMaker" lesson
+(carpentries-incubator/ML_with_AWS_SageMaker, MIT licence). What it adds, by
+audit problem (docs/dev-set-error-audit.md on lokesh/data-dev-set):
 
-- held-out pages are the team's dev set (whole documents), not a random 15% of
-  pages, so scores are honest about documents the model hasn't seen;
-- survey spreads are trained and read as two half-pages (see common.py);
-- dev pages are scored with the competition's own metric.py, per collection;
-- several pages are read at once, `#` is never a training target, and
-  training images can be lightly varied (--augment).
+ 1. Survey spreads read in the wrong order: spreads are trained and read as two
+    half-pages (prepare_data.py); a reading that stopped early or got stuck is
+    redone in two parts (--retry).
+ 2. Kade dev postcards are small, faint pencil: small images are enlarged to
+    the full pixel budget (--upscale), and training images are sometimes
+    shrunk and faded so the model sees such pages (--augment).
+ 3. Kade postmark line not in the image: never trained on; on small cards
+    the part every postmark line shares is added (--postmark_guess).
+ 4. Dialect spelling: no spelling correction anywhere, by design.
+ 5. Damaged Dominy pages: `#` is never a training target; training images
+    get faint mirrored bleed-through (--augment); contrast stretch (--enhance).
+ 6. Ledger symbols: check marks and × are removed from the output (common.py).
+ 7. Few or short pages count as much: Dominy's 27 training pages are repeated
+    each epoch (--oversample), each time with different random changes.
+ 8. Survey vocabulary: learned from the 365 survey training images.
+ 9. Machine-drafted labels: scores on expert-typed pages are reported apart.
 
 --epochs 0 only scores the dev pages with the model as it is (a baseline).
 
 Everything it writes goes to --out_dir:
 
     adapter_config.json, adapter_model.safetensors   the LoRA adapter (~30M numbers, ~120 MB)
-    dev_scores.csv        per dev page: CER, the model's text and the label
-    summary.json          settings, timings, dev CER per collection and overall
+    dev_scores.csv        per dev page: CER, length ratio, problem, the model's text and the label
+    summary.json          settings (training and reading), timings, dev CER per collection
     curve.json            dev CER on a few pages after every epoch, and the training loss
 """
 
@@ -40,14 +52,21 @@ from common import (  # noqa: E402
     MAX_PIXELS,
     MIN_PIXELS,
     MODEL_ID,
+    add_postmark_guess,
     augment,
     build_prompt,
     clean_output,
     full_messages,
     load_image,
     load_metadata,
+    looks_wrong,
+    top_bottom,
     user_messages,
 )
+
+# How pages are read. Saved in summary.json, so reading the test pages later
+# (transcribe.py) works exactly the way the dev pages were scored.
+READING_SETTINGS = ("max_pixels", "max_new_tokens", "upscale", "enhance", "retry", "postmark_guess")
 
 
 def page_cer_function():
@@ -55,7 +74,7 @@ def page_cer_function():
     repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     sys.path.insert(0, repo)
     import metric
-    return metric.page_cer
+    return metric.page_cer, metric.normalize_text
 
 
 def parse_args():
@@ -72,17 +91,31 @@ def parse_args():
     p.add_argument("--train_vision", type=int, default=0, help="1 = also train the image side of the model")
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--grad_accum", type=int, default=8)
-    p.add_argument("--max_pixels", type=int, default=MAX_PIXELS)
-    p.add_argument("--augment", default="", help="collections whose training images are varied, e.g. dominy_accounts, or all")
+    p.add_argument("--augment", default="all", help="collections whose training images get random changes: "
+                                                     "all, none, or a comma-separated list")
+    p.add_argument("--oversample", default="dominy_accounts:4",
+                   help="collections whose training images are used several times per epoch, e.g. dominy_accounts:4")
     p.add_argument("--max_train_items", type=int, default=0, help="0 = all; small for a smoke test")
     p.add_argument("--use_metadata", type=int, default=1)
+    # --- reading (training and scoring alike) ---
+    p.add_argument("--max_pixels", type=int, default=MAX_PIXELS)
+    p.add_argument("--upscale", type=int, default=1, help="1 = enlarge small images to the full pixel budget")
+    p.add_argument("--enhance", default="", help="collections whose images get a contrast stretch, e.g. dominy_accounts")
+    p.add_argument("--retry", type=int, default=1, help="1 = redo a reading that stopped early or got stuck, in two parts")
+    p.add_argument("--postmark_guess", type=int, default=1, help="1 = add 'Postmark , 19' on small Kade cards")
+    p.add_argument("--max_new_tokens", type=int, default=1536)
     # --- scoring ---
     p.add_argument("--dev_pages", type=int, default=0, help="dev pages scored at the end; 0 = all")
     p.add_argument("--curve_pages", type=int, default=3, help="dev pages per collection scored after every epoch (0 = none)")
     p.add_argument("--eval_batch", type=int, default=4, help="images read at once")
-    p.add_argument("--max_new_tokens", type=int, default=1536)
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
+
+
+def listed(setting, category):
+    """Is this collection named in a setting like 'all', 'none' or 'dominy_accounts,kade_letters'?"""
+    names = {s.strip() for s in str(setting).split(",") if s.strip()}
+    return "all" in names or category in names
 
 
 def pick_dtype():
@@ -134,53 +167,97 @@ def parse_box(box):
 
 
 @torch.no_grad()
-def read_pages(model, processor, page_ids, parts, data_dir, doc_ctx, categories, max_pixels,
-               max_new_tokens, batch, log_every=1):
-    """{page_id: text}. Each page is read whole or, for a survey spread, as two halves
-    (left, then right) joined with a newline; the text is then cleaned up."""
-    jobs = []   # (page_id, order, image path, box, prompt)
-    for pid in page_ids:
-        rows = parts[parts.page_id == pid]
-        prompt = build_prompt(categories[pid], doc_ctx.get(pid.rsplit("_", 1)[0], ""))
-        for order, r in enumerate(rows.to_dict("records")):
-            jobs.append((pid, order, os.path.join(data_dir, r["image"]), parse_box(r["box"]), prompt))
-    # Similar sizes together, so a batch doesn't pad small images up to a big one.
-    jobs.sort(key=lambda j: (j[3] is not None, j[4]))
-    pieces = {pid: {} for pid in page_ids}
+def generate(model, processor, jobs, opts, batch):
+    """Read a list of images: jobs are (key, image path, box, prompt, category). Returns {key: text}."""
+    out_texts = {}
+    jobs = sorted(jobs, key=lambda j: (j[2] is not None, j[3]))   # similar images together: less padding
     processor.tokenizer.padding_side = "left"
-    start, done = time.time(), 0
     for s in range(0, len(jobs), batch):
         chunk = jobs[s:s + batch]
-        texts = [processor.apply_chat_template(user_messages(j[4]), tokenize=False, add_generation_prompt=True)
+        texts = [processor.apply_chat_template(user_messages(j[3]), tokenize=False, add_generation_prompt=True)
                  for j in chunk]
-        images = [load_image(j[2], j[3], max_pixels) for j in chunk]
+        images = [load_image(j[1], j[2], opts["max_pixels"], bool(opts["upscale"]), listed(opts["enhance"], j[4]))
+                  for j in chunk]
         enc = processor(text=texts, images=images, padding=True, return_tensors="pt").to(model.device)
-        out = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False, repetition_penalty=1.05,
-                             use_cache=True)
+        out = model.generate(**enc, max_new_tokens=opts["max_new_tokens"], do_sample=False,
+                             repetition_penalty=1.05, use_cache=True)
         for j, text in zip(chunk, processor.batch_decode(out[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)):
-            pieces[j[0]][j[1]] = text.strip()
-        done += len(chunk)
-        if log_every and (s // batch) % log_every == 0:
-            print(f"  read {done}/{len(jobs)} images, {(time.time() - start) / done:.1f}s each", flush=True)
+            out_texts[j[0]] = text.strip()
     processor.tokenizer.padding_side = "right"
-    return {pid: clean_output("\n".join(p[k] for k in sorted(p)), categories[pid]) for pid, p in pieces.items()}
+    return out_texts
 
 
-def score_dev(model, processor, dev, parts, args, doc_ctx, page_cer, label):
-    """Read the dev pages, score each with metric.py, and report per collection."""
+def read_pages(model, processor, page_ids, parts, data_dir, doc_ctx, categories, opts, expected, batch):
+    """{page_id: text} and the set of pages that needed a second reading.
+
+    Each page is read whole or, for a survey spread, as two halves (left, then
+    right). A part whose reading looks wrong (nothing, far too short, or stuck
+    repeating) is read again as its top and bottom halves; the second reading
+    is kept if it looks right. Then the text is cleaned up, and small Kade cards
+    get the postmark guess."""
+    jobs, info = [], {}
+    for pid in page_ids:
+        cat = categories[pid]
+        prompt = build_prompt(cat, doc_ctx.get(pid.rsplit("_", 1)[0], ""))
+        for order, r in enumerate(parts[parts.page_id == pid].to_dict("records")):
+            box = parse_box(r["box"])
+            key = (pid, order)
+            jobs.append((key, os.path.join(data_dir, r["image"]), box, prompt, cat))
+            info[key] = {"expected": expected.get(f"{cat}/{'half' if box else 'page'}", 0),
+                         "size": (int(r.get("width") or 0), int(r.get("height") or 0))}
+    texts = generate(model, processor, jobs, opts, batch)
+
+    retried = set()
+    if opts["retry"]:
+        again = []
+        for key, path, box, prompt, cat in jobs:
+            if looks_wrong(texts[key], info[key]["expected"]):
+                w, h = info[key]["size"]
+                for half, half_box in zip(("top", "bottom"), top_bottom(box, w, h)):
+                    again.append(((key, half), path, half_box, prompt, cat))
+        if again:
+            second = generate(model, processor, again, opts, batch)
+            for key in {k for (k, _), *_ in again}:
+                joined = (second[(key, "top")] + "\n" + second[(key, "bottom")]).strip()
+                if not looks_wrong(joined, info[key]["expected"]) or len(joined) > len(texts[key]):
+                    texts[key] = joined
+                    retried.add(key[0])
+
+    result = {}
+    for pid in page_ids:
+        keys = sorted(k for k in texts if k[0] == pid)
+        text = clean_output("\n".join(texts[k] for k in keys), categories[pid])
+        if opts["postmark_guess"] and keys:
+            w, h = info[keys[0]]["size"]
+            text = add_postmark_guess(text, categories[pid], w, h)
+        result[pid] = text
+    return result, retried
+
+
+def score_dev(model, processor, dev, parts, args, opts, doc_ctx, expected, metric_fns, label):
+    """Read the dev pages, score each with metric.py, and report per collection,
+    along with the audit's length check: a reading under 0.7 of the label's length
+    probably stopped early or skipped part of the page; over 1.1, it probably
+    repeated something or read a part twice."""
+    page_cer, normalize = metric_fns
     was_training = model.training
     model.eval()
     start = time.time()
-    preds = read_pages(model, processor, list(dev.page_id), parts, args.data_dir, doc_ctx,
-                       dict(zip(dev.page_id, dev.category)), args.max_pixels, args.max_new_tokens, args.eval_batch,
-                       log_every=0)
-    rows = [{"page_id": r["page_id"], "category": r["category"], "cer": page_cer(preds[r["page_id"]], r["text"]),
-             "prediction": preds[r["page_id"]], "reference": r["text"]} for r in dev.to_dict("records")]
+    preds, retried = read_pages(model, processor, list(dev.page_id), parts, args.data_dir, doc_ctx,
+                                dict(zip(dev.page_id, dev.category)), opts, expected, args.eval_batch)
+    rows = []
+    for r in dev.to_dict("records"):
+        pred, ref = preds[r["page_id"]], r["text"]
+        ratio = len(normalize(pred)) / max(1, len(normalize(ref)))
+        rows.append({"page_id": r["page_id"], "category": r["category"], "label_source": r.get("label_source", ""),
+                     "cer": page_cer(pred, ref), "length_ratio": round(ratio, 2),
+                     "problem": "too short" if ratio < 0.7 else "too long" if ratio > 1.1 else "",
+                     "read_twice": r["page_id"] in retried, "prediction": pred, "reference": ref})
     df = pd.DataFrame(rows)
     by_cat = df.groupby("category")["cer"].mean()
     print(f"[dev {label}] {len(df)} pages in {(time.time() - start) / 60:.1f} min: "
-          + ", ".join(f"{c} {v:.3f}" for c, v in by_cat.items()) + f"; mean of collections {by_cat.mean():.3f}",
-          flush=True)
+          + ", ".join(f"{c} {v:.3f}" for c, v in by_cat.items()) + f"; mean of collections {by_cat.mean():.3f}"
+          + (f"; {len(retried)} read twice" if retried else ""), flush=True)
     if was_training:
         model.train()
     return df, by_cat
@@ -189,11 +266,22 @@ def score_dev(model, processor, dev, parts, args, doc_ctx, page_cer, label):
 # ---------------------------------------------------------------------------
 # Training data
 # ---------------------------------------------------------------------------
+def oversampled(items, setting):
+    """Repeat the training images of collections like 'dominy_accounts:4', so a
+    collection with few pages still counts in training (the score is the mean
+    of the three collections, so its 36 test pages weigh as much as Kade's 141)."""
+    extra = []
+    for part in [s for s in str(setting).split(",") if ":" in s]:
+        cat, times = part.split(":")
+        extra += [items[items.category == cat.strip()]] * (int(times) - 1)
+    return pd.concat([items, *extra]) if extra else items
+
+
 class PageDataset(Dataset):
-    def __init__(self, items, data_dir, doc_ctx, max_pixels, augment_categories, seed):
+    def __init__(self, items, data_dir, doc_ctx, opts, augment_setting, seed):
         self.rows = items.to_dict("records")
-        self.data_dir, self.doc_ctx, self.max_pixels = data_dir, doc_ctx, max_pixels
-        self.augment_categories = augment_categories
+        self.data_dir, self.doc_ctx, self.opts = data_dir, doc_ctx, opts
+        self.augment_setting = augment_setting
         self.rng = random.Random(seed)
 
     def __len__(self):
@@ -201,10 +289,12 @@ class PageDataset(Dataset):
 
     def __getitem__(self, i):
         r = self.rows[i]
-        img = load_image(os.path.join(self.data_dir, r["image"]), parse_box(r["box"]), self.max_pixels)
-        if "all" in self.augment_categories or r["category"] in self.augment_categories:
-            img = augment(img, self.rng)
-        prompt = build_prompt(r["category"], self.doc_ctx.get(r["doc_id"], ""))
+        cat = r["category"]
+        img = load_image(os.path.join(self.data_dir, r["image"]), parse_box(r["box"]), self.opts["max_pixels"],
+                         bool(self.opts["upscale"]), listed(self.opts["enhance"], cat))
+        if listed(self.augment_setting, cat):
+            img = augment(img, self.rng, cat)
+        prompt = build_prompt(cat, self.doc_ctx.get(r["doc_id"], ""))
         return {"image": img, "prompt": prompt, "answer": r["text"]}
 
 
@@ -249,27 +339,32 @@ def main():
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)
-    page_cer = page_cer_function()
+    metric_fns = page_cer_function()
+    opts = {k: getattr(args, k) for k in READING_SETTINGS}
 
     items = pd.read_csv(os.path.join(args.data_dir, "train_items.csv"), keep_default_na=False)
     dev = pd.read_csv(os.path.join(args.data_dir, "dev_pages.csv"), keep_default_na=False)
     parts = pd.read_csv(os.path.join(args.data_dir, "parts.csv"), keep_default_na=False)
+    expected_path = os.path.join(args.data_dir, "expected_chars.json")
+    expected = json.load(open(expected_path)) if os.path.exists(expected_path) else {}
     doc_ctx = load_metadata(os.path.join(args.data_dir, "metadata.csv")) if args.use_metadata else {}
     if args.max_train_items:
         items = per_category(items, lambda g: g.sample(min(len(g), max(1, args.max_train_items // 3)),
                                                        random_state=args.seed))
+    items = oversampled(items, args.oversample)
     if args.dev_pages:
         dev = per_category(dev, lambda g: g.sort_values("page_id").head(max(1, args.dev_pages // 3)))
     curve_dev = per_category(dev, lambda g: g.sort_values("page_id").head(args.curve_pages)) \
         if args.curve_pages else dev.iloc[0:0]
-    print(f"training images: {len(items)} ({', '.join(f'{c} {n}' for c, n in items.category.value_counts().items())}); "
+    print(f"training images per epoch: {len(items)} ({', '.join(f'{c} {n}' for c, n in items.category.value_counts().items())}); "
           f"dev pages: {len(dev)}", flush=True)
 
     model, processor, dtype = load_model(args.model_id, args.max_pixels)
     summary = {"model_id": args.model_id, "epochs": args.epochs, "lr": args.lr, "lora_r": args.lora_r,
                "lora_alpha": args.lora_alpha, "train_vision": args.train_vision, "augment": args.augment,
-               "max_pixels": args.max_pixels, "effective_batch": args.batch_size * args.grad_accum,
-               "train_images": len(items), "dev_pages": len(dev), "dtype": str(dtype).replace("torch.", "")}
+               "oversample": args.oversample, "effective_batch": args.batch_size * args.grad_accum,
+               "train_images_per_epoch": len(items), "dev_pages": len(dev),
+               "dtype": str(dtype).replace("torch.", ""), "reading": opts}
     curve, loss_log = [], []
 
     if args.epochs > 0:
@@ -279,18 +374,20 @@ def main():
 
         # LoRA on the language model's attention and MLP layers; with --train_vision 1,
         # also on the image encoder's ("visual") blocks.
-        layers = r"(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
-        target = (rf".*\.(?:{layers[1:-1]}|qkv|attn\.proj)$" if args.train_vision
-                  else rf"^(?!.*visual).*\.{layers}$")
+        layers = "q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj"
+        target = rf".*\.(?:{layers}|qkv|attn\.proj)$" if args.train_vision else rf"^(?!.*visual).*\.(?:{layers})$"
         model = get_peft_model(model, LoraConfig(r=args.lora_r, lora_alpha=args.lora_alpha,
                                                  lora_dropout=args.lora_dropout, bias="none",
                                                  task_type="CAUSAL_LM", target_modules=target))
         model.enable_input_require_grads()
         model.print_trainable_parameters()
 
+        def curve_point(epoch, label):
+            _, by_cat = score_dev(model, processor, curve_dev, parts, args, opts, doc_ctx, expected, metric_fns, label)
+            curve.append({"epoch": epoch, **by_cat.round(4).to_dict(), "mean": round(by_cat.mean(), 4)})
+
         if len(curve_dev):
-            _, by_cat = score_dev(model, processor, curve_dev, parts, args, doc_ctx, page_cer, "before training")
-            curve.append({"epoch": 0, **by_cat.round(4).to_dict(), "mean": round(by_cat.mean(), 4)})
+            curve_point(0, "before training")
 
         class Watch(TrainerCallback):
             def on_log(self, targs, state, control, logs=None, **kw):
@@ -302,10 +399,7 @@ def main():
 
             def on_epoch_end(self, targs, state, control, **kw):
                 if len(curve_dev):
-                    _, by_cat = score_dev(model, processor, curve_dev, parts, args, doc_ctx, page_cer,
-                                          f"after epoch {round(state.epoch)}")
-                    curve.append({"epoch": round(state.epoch), **by_cat.round(4).to_dict(),
-                                  "mean": round(by_cat.mean(), 4)})
+                    curve_point(round(state.epoch), f"after epoch {round(state.epoch)}")
 
         ckpt_dir = os.path.join(args.out_dir, "checkpoints")
         last = get_last_checkpoint(ckpt_dir) if os.path.isdir(ckpt_dir) else None
@@ -318,10 +412,8 @@ def main():
             logging_steps=5, save_strategy="epoch", save_total_limit=1, report_to="none",
             remove_unused_columns=False, dataloader_num_workers=2, seed=args.seed,
             use_cpu=not torch.cuda.is_available())
-        augment_categories = [c.strip() for c in args.augment.split(",") if c.strip()]
         trainer = Trainer(model=model, args=targs,
-                          train_dataset=PageDataset(items, args.data_dir, doc_ctx, args.max_pixels,
-                                                    augment_categories, args.seed),
+                          train_dataset=PageDataset(items, args.data_dir, doc_ctx, opts, args.augment, args.seed),
                           data_collator=Collator(processor), callbacks=[Watch()])
         start = time.time()
         result = trainer.train(resume_from_checkpoint=last)
@@ -331,10 +423,17 @@ def main():
         model.save_pretrained(args.out_dir)
 
     processor.save_pretrained(args.out_dir)
-    scores, by_cat = score_dev(model, processor, dev, parts, args, doc_ctx, page_cer,
+    scores, by_cat = score_dev(model, processor, dev, parts, args, opts, doc_ctx, expected, metric_fns,
                                "after training" if args.epochs > 0 else "baseline (no training)")
     scores.to_csv(os.path.join(args.out_dir, "dev_scores.csv"), index=False)
     summary["dev_cer"] = {**by_cat.round(4).to_dict(), "mean of collections": round(by_cat.mean(), 4)}
+    typed = scores[scores.label_source == "human"]
+    if len(typed):
+        summary["dev_cer_expert_typed_pages"] = typed.groupby("category")["cer"].mean().round(4).to_dict()
+    summary["dev_problems"] = {c: {"too short": int((g.problem == "too short").sum()),
+                                   "too long": int((g.problem == "too long").sum()),
+                                   "read twice": int(g.read_twice.sum()), "pages": len(g)}
+                               for c, g in scores.groupby("category")}
     with open(os.path.join(args.out_dir, "curve.json"), "w") as f:
         json.dump({"dev_cer_by_epoch": curve, "loss": loss_log}, f, indent=2)
     with open(os.path.join(args.out_dir, "summary.json"), "w") as f:

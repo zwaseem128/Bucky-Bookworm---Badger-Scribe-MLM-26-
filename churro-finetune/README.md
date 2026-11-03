@@ -5,19 +5,37 @@ pages, on whole pages from all three Badger Scribe collections at once: the Kade
 survey field notes and the Dominy account books. It runs entirely in a SageMaker notebook in your
 browser, so it works the same on a Mac or Windows.
 
-It is the "strong baseline" from the team's evaluation of fine-tuning options: the recipe from
-the SageMaker lesson (which took the Kade letters from a CER of 0.267 to 0.065 for $0.75 of GPU),
-with three changes:
+It starts from the recipe in the SageMaker lesson (which took the Kade letters from a CER of
+0.267 to 0.065 for $0.75 of GPU) and **tailors it to every problem in Lokesh's dev-set audit**
+(`docs/dev-set-error-audit.md` on `lokesh/data-dev-set`). Each fix below is also a setting, so
+you can turn it off and measure what it's worth.
 
-- **Honest scores.** Runs are scored on the team's 55 dev pages (`dev_ids.csv`: whole documents
-  set aside, never trained on), with the competition's own `metric.py`, per collection. The lesson
-  held out random pages from letters it also trained on, which makes scores look better than the
-  leaderboard will.
-- **Survey spreads read one page at a time.** Each survey image is an open notebook, two pages side
-  by side. Reading across the fold mixes the pages up, which caused most of the survey errors in
-  Lokesh's audit. Spreads are cut at the fold and read left page, then right page.
-- **Cleaner labels.** The Kade `Postmark` line (on the back of the card, not in the image) is taken
-  out of what the model learns, and the model is never trained to write `#`.
+## How each problem from the dev-set audit is tackled
+
+The numbers are the audit's own problem numbers.
+
+| Audit problem | What this folder does about it | Where |
+|---|---|---|
+| **1. Survey: the two-page spreads.** CHURRO stopped early, read a page twice, or wove the two pages together on 12 of 35 dev pages, and that was 77% of the survey error. | Each spread is cut at the fold and read one page at a time, left then right. Labels are split to match where they can (146 of 288 split at the right-hand page number). A reading that comes out empty, far shorter than that kind of page usually is, or stuck repeating itself, is read again in two parts, top and bottom, and the better reading is kept. | Notebook 1; `retry` |
+| **2. Kade: small, faint pencil postcards.** The dev postcards are 693 × 1151 pixels, half the detail of most Kade scans. | Small images are enlarged to the same pixel budget as the others, so the writing gets as much detail. In training, Kade images are sometimes shrunk and enlarged again and faded, so the model also learns from pages that look like the postcards. | `upscale`, `augment` |
+| **3. Kade: a `Postmark` line that isn't on the page** (10 of 11 dev labels end with one). | It's taken out of what the model learns, so it never invents dates. Then, measured on the training pages (not the dev letter): 15 of 22 small Kade images (under 1 megapixel: postcards) have a postmark line (68%), but only 54 of 262 larger ones (21%). So on small cards only, `Postmark , 19` is added: the part every postmark line shares. It saves about 13 characters of error when the label has one and costs 14 when it doesn't, so at 68% it gains about 4 characters per card on average. | `postmark_guess` |
+| **4. Kade: dialect spelling** (*jestern*, *bei die factry*). | Nothing corrects spelling, anywhere; the labels are learned exactly as written. | always |
+| **5. Dominy: stains, bleed-through, and `#` in the labels.** | `#` (what the transcriber couldn't read) is never something the model learns to write. Training images sometimes get a faint mirror image of the page on top, like ink from the back showing through. An optional contrast stretch for faded pages. | always; `augment`; `enhance` |
+| **6. Dominy: ledger symbols the labels leave out.** | No training label contains a check mark or `×`, so they're removed from the output; curly quotes and long dashes become plain ones; fractions are written ½ ¼ ¾ as the labels do. | always |
+| **7. Few pages, short pages.** Each collection is a third of the score, but Dominy has only 27 training pages. | Dominy's training images are used 4 times per epoch, each time with different random changes. | `oversample` |
+| **8. Survey: vocabulary and numbers.** | Learned from the 365 survey training images (pages and half-spreads). | training |
+| **9. Machine-drafted labels.** 42 of 44 English dev labels are drafts, about 6–8% wrong themselves. | The scores on the expert-typed dev pages are shown separately. | scoring |
+
+Two more things help with all of them:
+
+- **Honest scores.** Every run is scored on the team's 55 dev pages (`dev_ids.csv`): whole
+  documents set aside, never trained on. Scoring uses the competition's own `metric.py`, per
+  collection, plus the audit's length check: how many pages came out too short (under 0.7 of the
+  label's length) or too long (over 1.1). The lesson held out random pages from letters it also
+  trained on, which flatters the score.
+- **Separating the effects.** Notebook 2 has a `"plain"` run (CHURRO with none of the reading
+  fixes) and a `"baseline"` run (with them, but no training), so you can see what the fixes are
+  worth on their own and what training adds on top.
 
 ## What's in the folder
 
@@ -37,15 +55,16 @@ On an **`ml.g5.xlarge`** (one A10G GPU, about $1.41 an hour), the recommended in
 |---|---|---|
 | Notebook 1 | 15–20 min | Downloading about 2.5 GB of page images; finding the fold in 319 survey spreads |
 | Notebook 2, `"smoke"` | 10–15 min | Downloading the 7.5 GB model (first time only) |
-| Notebook 2, `"baseline"` | 15–30 min | Reading the 55 dev pages (90 images, with the survey halves) |
-| Notebook 2, `"full"` | 1–1.5 hours | Training: about 680 images × 2 epochs, ~35 min. A few dev pages after each epoch, ~10 min. All 55 dev pages at the end, 15–30 min. |
+| Notebook 2, `"plain"` | 15–30 min | Reading the 55 dev pages (90 images, with the survey halves) |
+| Notebook 2, `"baseline"` | 15–35 min | The same, plus second readings of parts that look wrong |
+| Notebook 2, `"full"` | 1–1.5 hours | Training: about 760 images per epoch (Dominy's used 4 times) × 2 epochs, ~40 min. A few dev pages after each epoch, ~10 min. All 55 dev pages at the end, 15–35 min. |
 | Notebook 3 | 40–60 min | Reading the 208 test pages (239 images, with the survey halves) |
-| **All of it, once** | **about 3–3.5 hours** | **about $4–5** |
+| **All of it, once** | **about 3.5–4 hours** | **about $5–6** |
 
 Each extra `"full"` run with different settings adds 1 to 1.5 hours.
 
 On an **`ml.g4dn.xlarge`** (T4 GPU, about $0.74 an hour), expect about 2.5 times as long, so
-roughly 8 hours for everything, at about the same cost. The T4 can't train in bf16, and this model
+roughly 9 hours for everything, at about the same cost. The T4 can't train in bf16, and this model
 in fp16 can fail with a `nan` loss, so the g5 (or `ml.g6.xlarge`, $1.13 an hour) is the safer
 choice.
 
@@ -112,16 +131,22 @@ not `conda_python3`). Run the cells from top to bottom with **Shift + Enter**.
    right pages (about half split at the right-hand page number; the rest are trained whole).
 4. **Check a spread by eye.** A red line shows where it was cut; it should run down the fold, not
    through writing. Look at a few. If it's wrong on many, tell the team before training.
+5. **See what the model trains on.** One page per collection, as it is and with three random
+   changes. They should look like other scans of the same page, never like damage.
 
 **Notebook 2** (each run):
 1. Install the libraries (after every start of the instance, before any other cell).
 2. Set up the folders.
 3. Check the GPU, disk and data. It warns if the GPU is a T4.
-4. Choose the run. Do `"smoke"` first, then `"baseline"`, then `"full"`.
+4. Choose the run. Do `"smoke"` first, then `"plain"`, `"baseline"` and `"full"`. The step also
+   has a table of the audit's problems and the setting for each fix.
 5. Train and score. You can close the browser; it keeps going. `train.log` in the run's folder
    shows progress.
-6. The scores: dev CER per collection and their mean (Kaggle's score), next to the baseline.
-7. One page in detail, with the model's mistakes coloured in.
+6. The scores: dev CER per collection and their mean (Kaggle's score), next to `"plain"` and
+   `"baseline"`; the expert-typed pages on their own; and the length check (pages too short, too
+   long, read twice) per collection.
+7. The pages the length check flagged, then one page in detail with the model's mistakes coloured
+   in.
 8. Save the run to S3.
 
 **Notebook 3** (when you have a good run):
@@ -142,9 +167,17 @@ scores in the team's results table.
 | `lr` | `2e-4` | How big each correction is. | Scores get worse after epoch 1: try `1e-4`. |
 | `lora_r`, `lora_alpha` | 16, 32 | How big and how strong the adapter is. Keep alpha at twice r. | Training loss stays high: try 32 and 64. |
 | `grad_accum` | 8 | How many images it sees before each correction. | Rarely. |
-| `augment` | `"dominy_accounts"` | Small random changes to training images (a slight tilt, brightness, contrast, blur), so the 27 Dominy training pages go further. | Try `"all"`, or `""` to compare without. |
+| `augment` | `"all"` | Random changes to training images (problems 2, 5 and 7): a tilt, brightness, contrast, sharpness; postcard-like shrinking and fading for Kade; faint bleed-through for Dominy. | Try `"none"` to measure what it's worth. |
+| `oversample` | `"dominy_accounts:4"` | Uses a collection's images several times per epoch (problem 7). | Dominy's dev score lags the others: try `:6`. Try `""` to measure it. |
 | `train_vision` | 0 | 1 also trains the part of the model that looks at the image, not just the part that writes. Might help with Kurrent letterforms. | Try once the others are settled. |
 | `max_pixels` | about 1 megapixel | Image detail. More is slower and, per the lesson, rarely helps. | Small characters (fractions like ½) are misread. |
+| `upscale` | 1 | Enlarges small images to the full pixel budget (problem 2). | Set 0 to measure it. |
+| `enhance` | `""` | A contrast stretch for the named collections (problem 5), e.g. `"dominy_accounts"`. Off by default: the audit says to judge it on the dev scores. | Try `"dominy_accounts"`. |
+| `retry` | 1 | Reads a part again, top and bottom separately, when its first reading is empty, far too short, or stuck repeating (problems 1 and 7). | Set 0 to measure it. |
+| `postmark_guess` | 1 | Adds `Postmark , 19` on small Kade cards (problem 3). | Set 0 if the team decides against it. |
+
+The reading settings (`max_pixels`, `upscale`, `enhance`, `retry`, `postmark_guess`) are saved
+with each run, and Notebook 3 reads the test pages with exactly the chosen run's settings.
 
 **Reading the scores.** The dev set is small: 11 Kade pages from one letter, 35 survey pages from
 one notebook, 9 Dominy pages. A difference of 0.01 to 0.02 may be luck; run the same settings
@@ -164,6 +197,7 @@ closely the model copies the drafting model.
 | Notebook 1: "There is no badger-scribe/train.csv" | The data isn't at that place in the bucket; the message says where `train.csv` is, or that it isn't there. |
 | Notebook 1: a collection has 0 training pages | `train.csv` is the Kade-only class copy. Use the full competition data. |
 | The red line in Step 4 cuts through writing | The fold wasn't found on that spread. Tell the team which spreads; the cut can be turned off with `prepare_data.build(DATA, "dev_ids.csv", split_spreads=False)`. |
+| Many pages "read twice" in the length check | Their first readings came out empty, far too short or looping. If the second readings don't fix them, look at those pages in Step 7. |
 | Want to start a run over | Delete its folder in `~/SageMaker/churro-work/runs/` and run Notebook 2 from Step 4. |
 
 ## Credits
@@ -171,6 +205,6 @@ closely the model copies the drafting model.
 The training script is adapted from `finetune_churro_lora.py` and `badger_common.py` in the
 [ML with AWS SageMaker](https://carpentries-incubator.github.io/ML_with_AWS_SageMaker/09_Finetuning-BadgerScribe.html)
 lesson (MIT licence). The output clean-up and collection hints come from Lokesh's
-`churro_simple.py`; the dev set and the survey findings from Lokesh's dev-set work. CHURRO-3B is by
+`churro_simple.py`; the dev set and every problem tackled here from Lokesh's dev-set audit. CHURRO-3B is by
 Stanford OVAL ([paper](https://arxiv.org/abs/2509.19768)), under the Qwen research licence
 (non-commercial use).

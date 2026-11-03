@@ -3,11 +3,14 @@
 Run by 1_prepare_data.ipynb. Reads <data>/train.csv, <data>/test.csv and
 <data>/images/, plus dev_ids.csv (the team's dev set), and writes into <data>:
 
-    parts.csv        page_id, part, image, box     how each page is read: whole, or, for a
+    parts.csv        page_id, part, image, box, width, height
+                                                   how each page is read: whole, or, for a
                                                    survey spread, left half then right half
+    expected_chars.json                            how long a page (or half) of each collection
+                                                   usually is, to catch readings that stopped early
     train_items.csv  page_id, doc_id, category, image, box, text
                                                    one row per training image (dev pages left out)
-    dev_pages.csv    page_id, doc_id, category, text
+    dev_pages.csv    page_id, doc_id, category, label_source, text
                                                    the dev pages and their full labels, for scoring
     test_pages.csv   page_id, category             the pages Kaggle scores us on
 
@@ -16,6 +19,7 @@ training images, one per page; one whose label doesn't split is trained on
 whole. Either way, every survey spread is read in two halves.
 """
 
+import json
 import os
 import sys
 
@@ -43,15 +47,15 @@ def build(data_dir, dev_ids_csv, split_spreads=True):
         if not os.path.exists(path):
             missing.append(r["page_id"])
             continue
-        if split_spreads and r["category"] == "survey_notes":
-            with Image.open(path) as img:
-                if is_spread(*img.size):
-                    left, right = spread_halves(img.width, img.height, find_fold(img))
-                    boxes[r["page_id"]] = (left, right)
-                    parts += [{"page_id": r["page_id"], "part": "left", "image": image, "box": ",".join(map(str, left))},
-                              {"page_id": r["page_id"], "part": "right", "image": image, "box": ",".join(map(str, right))}]
-                    continue
-        parts.append({"page_id": r["page_id"], "part": "page", "image": image, "box": ""})
+        with Image.open(path) as img:
+            size = {"width": img.width, "height": img.height}
+            if split_spreads and r["category"] == "survey_notes" and is_spread(*img.size):
+                left, right = spread_halves(img.width, img.height, find_fold(img))
+                boxes[r["page_id"]] = (left, right)
+                parts += [{"page_id": r["page_id"], "part": "left", "image": image, "box": ",".join(map(str, left)), **size},
+                          {"page_id": r["page_id"], "part": "right", "image": image, "box": ",".join(map(str, right)), **size}]
+                continue
+        parts.append({"page_id": r["page_id"], "part": "page", "image": image, "box": "", **size})
     pd.DataFrame(parts).to_csv(os.path.join(data_dir, "parts.csv"), index=False)
 
     # Training images: everything in train.csv except the dev pages.
@@ -74,7 +78,17 @@ def build(data_dir, dev_ids_csv, split_spreads=True):
     items = pd.DataFrame(items)
     items.to_csv(os.path.join(data_dir, "train_items.csv"), index=False)
 
-    dev = train[train["page_id"].isin(dev_ids)][["page_id", "doc_id", "category", "text"]]
+    # How long each kind of image's text usually is (whole pages and half-spreads
+    # separately), so a reading far shorter than that can be caught and redone.
+    lengths = items.assign(kind=items.box.ne("").map({True: "half", False: "page"}),
+                           chars=items.text.map(lambda t: len(" ".join(t.split()))))
+    expected = {f"{c}/{k}": float(g.chars.median()) for (c, k), g in lengths.groupby(["category", "kind"])}
+    with open(os.path.join(data_dir, "expected_chars.json"), "w") as f:
+        json.dump(expected, f, indent=2)
+
+    if "label_source" not in train.columns:
+        train["label_source"] = ""
+    dev = train[train["page_id"].isin(dev_ids)][["page_id", "doc_id", "category", "label_source", "text"]]
     dev.to_csv(os.path.join(data_dir, "dev_pages.csv"), index=False)
     test[["page_id", "category"]].to_csv(os.path.join(data_dir, "test_pages.csv"), index=False)
 

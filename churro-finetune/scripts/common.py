@@ -6,8 +6,9 @@ reading new pages.
 
 Adapted from badger_common.py in the "ML with AWS SageMaker" lesson
 (carpentries-incubator/ML_with_AWS_SageMaker, MIT licence), with the team's
-additions: a hint per collection, survey spreads cut at the fold, and label
-and output clean-up from Lokesh's churro_simple.py and dev-set audit.
+additions aimed at the problems in Lokesh's dev-set audit
+(docs/dev-set-error-audit.md on lokesh/data-dev-set). Each addition below
+names the problem it is for.
 """
 
 import re
@@ -153,7 +154,10 @@ def training_text(text: str, category: str) -> str:
 # Output clean-up (from churro_simple.py; every rule was checked against the
 # 619 references in train.csv)
 # ---------------------------------------------------------------------------
-_PLAIN = str.maketrans({"—": "-", "–": "-", "‘": "'", "’": "'", "“": '"', "”": '"', "„": '"', "…": "...", "|": " "})
+# Audit problem 6 (Dominy ledgers): no label in train.csv contains a check mark
+# or ×, so they are always errors. Curly quotes and long dashes become plain ones.
+_PLAIN = str.maketrans({"—": "-", "–": "-", "‘": "'", "’": "'", "“": '"', "”": '"', "„": '"', "…": "...", "|": " ",
+                        "×": "x", "✓": "", "✔": "", "✗": "", "✘": ""})
 _FRACTIONS = {"1/2": "½", "1/4": "¼", "3/4": "¾"}
 
 
@@ -183,23 +187,101 @@ def clean_output(text: str, category: str = "", max_chars: int = 3000) -> str:
 # ---------------------------------------------------------------------------
 # Images
 # ---------------------------------------------------------------------------
-def load_image(path, box=None, max_pixels: int = MAX_PIXELS) -> Image.Image:
-    """Open a page (or one half of a spread), decoded at about the size the model sees."""
+def load_image(path, box=None, max_pixels: int = MAX_PIXELS, upscale: bool = True,
+               enhance: bool = False) -> Image.Image:
+    """Open a page (or one part of it), ready for the model.
+
+    upscale (audit problem 2, Kade): the dev postcards are 693 x 1151 pixels,
+    half the size of most Kade scans, in faint pencil. A small image is
+    enlarged to the same pixel budget as the others, so its writing gets as
+    many image tokens.
+    enhance (audit problem 5, Dominy): stretches the contrast, for stained,
+    faded pages. Off unless asked for; judge it on the dev scores.
+    """
     img = Image.open(path)
     if box is None:
         side = int((max_pixels * 2) ** 0.5)
         img.draft("RGB", (side, side))   # lets the JPEG decoder skip detail we'd throw away
     img = img.convert("RGB")
-    return img.crop(tuple(box)) if box is not None else img
+    if box is not None:
+        img = img.crop(tuple(box))
+    if upscale and img.width * img.height < 0.8 * max_pixels:
+        f = (max_pixels / (img.width * img.height)) ** 0.5
+        img = img.resize((int(img.width * f), int(img.height * f)), Image.LANCZOS)
+    if enhance:
+        from PIL import ImageOps
+        img = ImageOps.autocontrast(img, cutoff=1)
+    return img
 
 
-def augment(img: Image.Image, rng) -> Image.Image:
-    """A light random change to a training image, so 27 Dominy pages go further:
-    a small tilt, a little brightness and contrast change, sometimes a slight blur."""
-    from PIL import ImageEnhance
-    img = img.rotate(rng.uniform(-1.5, 1.5), resample=Image.BICUBIC, expand=False, fillcolor=(235, 228, 210))
+def augment(img: Image.Image, rng, category: str = "") -> Image.Image:
+    """A random change to a training image, different every time it's used, so a
+    few pages go further. Every collection gets a small tilt and a little change
+    in brightness, contrast and sharpness. On top of that:
+
+    kade_letters (audit problem 2): sometimes the image is shrunk and enlarged
+        again, and faded, so the model also sees low-resolution, faint pencil
+        like the dev postcards, which are unlike most training scans.
+    dominy_accounts (audit problem 5): sometimes the page is mixed faintly with
+        its own mirror image, like ink showing through from the back, the
+        bleed-through on the stained ledgers.
+    """
+    from PIL import ImageEnhance, ImageOps
+    paper = (235, 228, 210)
+    img = img.rotate(rng.uniform(-1.5, 1.5), resample=Image.BICUBIC, expand=False, fillcolor=paper)
+    if category == "kade_letters" and rng.random() < 0.5:
+        w, h = img.size
+        f = rng.uniform(0.45, 0.7)
+        img = img.resize((max(1, int(w * f)), max(1, int(h * f))), Image.BILINEAR).resize((w, h), Image.BICUBIC)
+    if category == "kade_letters" and rng.random() < 0.3:
+        img = Image.blend(img, Image.new("RGB", img.size, paper), rng.uniform(0.15, 0.35))   # fainter pencil
+    if category == "dominy_accounts" and rng.random() < 0.4:
+        img = Image.blend(img, ImageOps.mirror(img), rng.uniform(0.08, 0.18))               # bleed-through
     img = ImageEnhance.Brightness(img).enhance(rng.uniform(0.85, 1.15))
     img = ImageEnhance.Contrast(img).enhance(rng.uniform(0.8, 1.25))
     if rng.random() < 0.3:
         img = img.filter(ImageFilter.GaussianBlur(rng.uniform(0.3, 0.9)))
     return img
+
+
+# ---------------------------------------------------------------------------
+# Catching a bad reading (audit problems 1 and 7)
+# ---------------------------------------------------------------------------
+def looks_wrong(text: str, expected_chars: float) -> bool:
+    """True when a reading has probably gone wrong: nothing written, far shorter
+    than this kind of page usually is (the model stopped early), or a chunk of
+    text repeated over and over (the model got stuck). Kept strict, because a
+    nearly empty page (an envelope, a cover) is allowed to be short."""
+    t = " ".join(text.split())
+    if not t:
+        return True
+    if re.search(r"(.{20,}?)(?:\s*\1){2,}", t):
+        return True
+    return expected_chars > 0 and len(t) < 0.25 * expected_chars
+
+
+def top_bottom(box, width, height, overlap=0.06):
+    """The top and bottom halves of an image (or of one part of it), overlapping a little."""
+    l, t, r, b = box if box else (0, 0, width, height)
+    mid, pad = (t + b) // 2, int(overlap * (b - t))
+    return (l, t, r, mid + pad), (l, mid - pad, r, b)
+
+
+# ---------------------------------------------------------------------------
+# The Kade postmark line (audit problem 3)
+# ---------------------------------------------------------------------------
+# The postmark is on the back of the card, so the model can't read it; but
+# in the training pages (not the dev letter kade_112), small Kade images (under
+# 1 megapixel: postcards) have a postmark line in 15 of 22 labels (68%), larger
+# ones in only 54 of 262 (21%). Every postmark line reads "Postmark <Month>
+# <day>, <year>", so writing the part they all share saves about 13 edits when
+# the label has one and costs 14 when it doesn't: worth it on small cards
+# (0.68 x 13 > 0.32 x 14), not on larger pages.
+POSTMARK_GUESS = "Postmark , 19"
+SMALL_CARD_PIXELS = 1_000_000
+
+
+def add_postmark_guess(text: str, category: str, width: int, height: int) -> str:
+    if category == "kade_letters" and width * height < SMALL_CARD_PIXELS and "Postmark" not in text:
+        return (text + "\n" + POSTMARK_GUESS).strip()
+    return text
