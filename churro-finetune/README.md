@@ -189,9 +189,21 @@ scores in the team's results table.
 | `enhance` | `""` | A contrast stretch for the named collections (problem 5), e.g. `"dominy_accounts"`. Off by default: the audit says to judge it on the dev scores. | Try `"dominy_accounts"`. |
 | `retry` | 1 | Reads a part again, top and bottom separately, when its first reading is empty, far too short, or stuck repeating (problems 1 and 7). | Set 0 to measure it. |
 | `postmark_guess` | 1 | Adds `Postmark , 19` on small Kade cards (problem 3). | Set 0 if the team decides against it. |
+| `repetition_penalty` | 1.05 | Discourages the model from writing the same text twice. It can also penalise words a letter really repeats. | Try 1.0: no retraining needed, use `"kade-baseline"` or a finished run's settings. |
 
-The reading settings (`max_pixels`, `upscale`, `enhance`, `retry`, `postmark_guess`) are saved
-with each run, and Notebook 3 reads the test pages with exactly the chosen run's settings.
+The reading settings (`max_pixels`, `upscale`, `enhance`, `retry`, `postmark_guess`,
+`repetition_penalty`) are saved with each run, and Notebook 3 reads the test pages with exactly
+the chosen run's settings.
+
+### Kade runs: held-out documents
+
+All 11 Kade dev pages are from one document, so they can't show how a new document reads, or
+when training starts memorising. `RUN = "kade-baseline"` and `RUN = "kade"` instead leave whole
+documents out of training (`SPLIT = "A"`: kade_007 and kade_112; `"B"`: kade_128 and kade_112)
+and score them. They report each document, the score without the postmark line, and the score on
+10 training pages. A `"kade"` run trains on Kade only for 5 epochs, scores every held-out page
+after each epoch, and keeps each epoch's adapter in `epoch1/` to `epoch5/`. Choose settings on
+split A, confirm on split B, and use the page-by-page comparison in Step 6 rather than the mean.
 
 **Reading the scores.** The dev set is small: 11 Kade pages from one letter, 35 survey pages from
 one notebook, 9 Dominy pages. A difference of 0.01 to 0.02 may be luck; run the same settings

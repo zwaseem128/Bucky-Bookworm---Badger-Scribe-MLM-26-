@@ -66,7 +66,14 @@ from common import (  # noqa: E402
 
 # How pages are read. Saved in summary.json, so reading the test pages later
 # (transcribe.py) works exactly the way the dev pages were scored.
-READING_SETTINGS = ("max_pixels", "max_new_tokens", "upscale", "enhance", "retry", "postmark_guess")
+READING_SETTINGS = ("max_pixels", "max_new_tokens", "upscale", "enhance", "retry", "postmark_guess",
+                    "repetition_penalty")
+
+
+def without_postmark(text):
+    """The text without its 'Postmark ...' lines. The postmark is on the back of a Kade card,
+    so no model can read it; scoring without it shows how well the front was read."""
+    return "\n".join(l for l in str(text).split("\n") if not l.strip().startswith("Postmark"))
 
 
 def page_cer_function():
@@ -104,6 +111,18 @@ def parse_args():
     p.add_argument("--retry", type=int, default=1, help="1 = redo a reading that stopped early or got stuck, in two parts")
     p.add_argument("--postmark_guess", type=int, default=1, help="1 = add 'Postmark , 19' on small Kade cards")
     p.add_argument("--max_new_tokens", type=int, default=1536)
+    p.add_argument("--repetition_penalty", type=float, default=1.05,
+                   help="above 1.0 discourages repeating text; 1.0 = off")
+    # --- which pages ---
+    p.add_argument("--categories", default="all",
+                   help="collections to train and score on: all, or a comma-separated list, e.g. kade_letters")
+    p.add_argument("--holdout_docs", default="",
+                   help="documents (doc_id) left out of training and scored instead of the usual dev pages of "
+                        "their collection, e.g. kade_007,kade_112")
+    p.add_argument("--train_score_pages", type=int, default=0,
+                   help="training pages per collection scored at the end, to see the overfitting gap (0 = none)")
+    p.add_argument("--save_every_epoch", type=int, default=0,
+                   help="1 = also keep the adapter of every epoch, in epoch1/, epoch2/, ...")
     # --- scoring ---
     p.add_argument("--dev_pages", type=int, default=0, help="dev pages scored at the end; 0 = all")
     p.add_argument("--curve_pages", type=int, default=3, help="dev pages per collection scored after every epoch (0 = none)")
@@ -180,7 +199,7 @@ def generate(model, processor, jobs, opts, batch):
                   for j in chunk]
         enc = processor(text=texts, images=images, padding=True, return_tensors="pt").to(model.device)
         out = model.generate(**enc, max_new_tokens=opts["max_new_tokens"], do_sample=False,
-                             repetition_penalty=1.05, use_cache=True)
+                             repetition_penalty=opts.get("repetition_penalty", 1.05), use_cache=True)
         for j, text in zip(chunk, processor.batch_decode(out[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)):
             out_texts[j[0]] = text.strip()
     processor.tokenizer.padding_side = "right"
@@ -249,8 +268,10 @@ def score_dev(model, processor, dev, parts, args, opts, doc_ctx, expected, metri
     for r in dev.to_dict("records"):
         pred, ref = preds[r["page_id"]], r["text"]
         ratio = len(normalize(pred)) / max(1, len(normalize(ref)))
-        rows.append({"page_id": r["page_id"], "category": r["category"], "label_source": r.get("label_source", ""),
-                     "cer": page_cer(pred, ref), "length_ratio": round(ratio, 2),
+        rows.append({"page_id": r["page_id"], "doc_id": r.get("doc_id", ""), "category": r["category"],
+                     "label_source": r.get("label_source", ""),
+                     "cer": page_cer(pred, ref), "cer_no_postmark": page_cer(without_postmark(pred), without_postmark(ref)),
+                     "length_ratio": round(ratio, 2),
                      "problem": "too short" if ratio < 0.7 else "too long" if ratio > 1.1 else "",
                      "read_twice": r["page_id"] in retried, "prediction": pred, "reference": ref})
     df = pd.DataFrame(rows)
@@ -258,6 +279,10 @@ def score_dev(model, processor, dev, parts, args, opts, doc_ctx, expected, metri
     print(f"[dev {label}] {len(df)} pages in {(time.time() - start) / 60:.1f} min: "
           + ", ".join(f"{c} {v:.3f}" for c, v in by_cat.items()) + f"; mean of collections {by_cat.mean():.3f}"
           + (f"; {len(retried)} read twice" if retried else ""), flush=True)
+    if (df.category == "kade_letters").any():
+        kade = df[df.category == "kade_letters"]
+        print(f"    kade_letters without postmarks {kade.cer_no_postmark.mean():.3f}; by document: "
+              + ", ".join(f"{d} {v:.3f}" for d, v in kade.groupby("doc_id")["cer"].mean().items()), flush=True)
     if was_training:
         model.train()
     return df, by_cat
@@ -348,6 +373,34 @@ def main():
     expected_path = os.path.join(args.data_dir, "expected_chars.json")
     expected = json.load(open(expected_path)) if os.path.exists(expected_path) else {}
     doc_ctx = load_metadata(os.path.join(args.data_dir, "metadata.csv")) if args.use_metadata else {}
+    train_pages = None
+    if args.holdout_docs or args.train_score_pages:
+        train_pages = pd.read_csv(os.path.join(args.data_dir, "train.csv"), keep_default_na=False, encoding="utf-8-sig")
+        if "category" not in train_pages.columns:
+            from common import category_of
+            train_pages["category"] = train_pages["page_id"].map(category_of)
+        if "label_source" not in train_pages.columns:
+            train_pages["label_source"] = ""
+        train_pages = train_pages[train_pages.page_id.isin(set(parts.page_id))]   # pages with an image
+    if args.holdout_docs:
+        # Score whole documents the model never trained on. Pages within a document share pen,
+        # paper and scan, so held-out pages of a trained document would flatter the score.
+        held = {d.strip() for d in args.holdout_docs.split(",") if d.strip()}
+        unknown = held - set(train_pages.doc_id)
+        if unknown:
+            raise SystemExit(f"No such document in train.csv: {', '.join(sorted(unknown))}")
+        items = items[~items.doc_id.isin(held)]
+        held_pages = train_pages[train_pages.doc_id.isin(held)]
+        dev = pd.concat([dev[~dev.category.isin(set(held_pages.category))],
+                         held_pages[["page_id", "doc_id", "category", "label_source", "text"]]], ignore_index=True)
+        print(f"held out: {', '.join(f'{d} ({n} pages)' for d, n in held_pages.doc_id.value_counts().sort_index().items())}",
+              flush=True)
+    if args.categories != "all":
+        items = items[items.category.map(lambda c: listed(args.categories, c))]
+        dev = dev[dev.category.map(lambda c: listed(args.categories, c))]
+        if not len(items) and args.epochs > 0:
+            raise SystemExit(f"No training images in collections '{args.categories}'.")
+    trained_on = sorted(set(items.page_id))
     if args.max_train_items:
         items = per_category(items, lambda g: g.sample(min(len(g), max(1, args.max_train_items // 3)),
                                                        random_state=args.seed))
@@ -364,6 +417,8 @@ def main():
                "lora_alpha": args.lora_alpha, "train_vision": args.train_vision, "augment": args.augment,
                "oversample": args.oversample, "effective_batch": args.batch_size * args.grad_accum,
                "train_images_per_epoch": len(items), "dev_pages": len(dev),
+               "categories": args.categories, "holdout_docs": args.holdout_docs,
+               "trained_on_docs": sorted(set(items.doc_id)),
                "dtype": str(dtype).replace("torch.", ""), "reading": opts}
     curve, loss_log = [], []
 
@@ -383,8 +438,12 @@ def main():
         model.print_trainable_parameters()
 
         def curve_point(epoch, label):
-            _, by_cat = score_dev(model, processor, curve_dev, parts, args, opts, doc_ctx, expected, metric_fns, label)
-            curve.append({"epoch": epoch, **by_cat.round(4).to_dict(), "mean": round(by_cat.mean(), 4)})
+            df, by_cat = score_dev(model, processor, curve_dev, parts, args, opts, doc_ctx, expected, metric_fns, label)
+            point = {"epoch": epoch, **by_cat.round(4).to_dict(), "mean": round(by_cat.mean(), 4)}
+            if (df.category == "kade_letters").any():
+                point["kade_letters without postmarks"] = round(df[df.category == "kade_letters"].cer_no_postmark.mean(), 4)
+            df.to_csv(os.path.join(args.out_dir, f"curve_scores_epoch{epoch}.csv"), index=False)
+            curve.append(point)
 
         if len(curve_dev):
             curve_point(0, "before training")
@@ -398,6 +457,8 @@ def main():
                                          "(ml.g4dn). Use an ml.g5.xlarge or ml.g6.xlarge instance, which trains in bf16.")
 
             def on_epoch_end(self, targs, state, control, **kw):
+                if args.save_every_epoch:
+                    model.save_pretrained(os.path.join(args.out_dir, f"epoch{round(state.epoch)}"))
                 if len(curve_dev):
                     curve_point(round(state.epoch), f"after epoch {round(state.epoch)}")
 
@@ -427,6 +488,17 @@ def main():
                                "after training" if args.epochs > 0 else "baseline (no training)")
     scores.to_csv(os.path.join(args.out_dir, "dev_scores.csv"), index=False)
     summary["dev_cer"] = {**by_cat.round(4).to_dict(), "mean of collections": round(by_cat.mean(), 4)}
+    summary["dev_cer_no_postmark"] = scores.groupby("category")["cer_no_postmark"].mean().round(4).to_dict()
+    summary["dev_cer_by_doc"] = scores.groupby("doc_id")["cer"].mean().round(4).to_dict()
+    if args.train_score_pages:
+        # The same reading on pages the model trained on. A big gap between these and the
+        # held-out pages means it learned those pages rather than how to read.
+        seen = train_pages[train_pages.page_id.isin(trained_on)]
+        seen = per_category(seen, lambda g: g.sort_values("page_id").head(args.train_score_pages))
+        train_scores, train_by_cat = score_dev(model, processor, seen, parts, args, opts, doc_ctx, expected,
+                                               metric_fns, "training pages (overfitting check)")
+        train_scores.to_csv(os.path.join(args.out_dir, "train_page_scores.csv"), index=False)
+        summary["train_pages_cer"] = train_by_cat.round(4).to_dict()
     typed = scores[scores.label_source == "human"]
     if len(typed):
         summary["dev_cer_expert_typed_pages"] = typed.groupby("category")["cer"].mean().round(4).to_dict()
