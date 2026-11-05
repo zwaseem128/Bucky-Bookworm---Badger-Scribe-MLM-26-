@@ -190,9 +190,11 @@ scores in the team's results table.
 | `retry` | 1 | Reads a part again, top and bottom separately, when its first reading is empty, far too short, or stuck repeating (problems 1 and 7). | Set 0 to measure it. |
 | `postmark_guess` | 1 | Adds `Postmark , 19` on small Kade cards (problem 3). | Set 0 if the team decides against it. |
 | `repetition_penalty` | 1.05 | Discourages the model from writing the same text twice. It can also penalise words a letter really repeats. | Try 1.0: no retraining needed, use `"kade-baseline"` or a finished run's settings. |
+| `cut_repeats` | `""` | Cuts a reading where it starts repeating a 22-character stretch it already wrote, for the named collections. Untrained CHURRO often reads a letter correctly, then keeps inventing text. On the 88 held-out Kade pages this took the untrained score from 0.327 to 0.266; it cost two pages about 0.2 each. | Try `"kade_letters"` with `"rescore"` on a trained adapter. Don't use it on survey notes without testing: their tables repeat on purpose. |
+| `retry_pick` | `"longer"` | When both readings of a part look wrong, which to keep. `"longer"` was the original rule, but a reading stuck repeating is the long one; `"closer"` keeps the one whose length is closer to the usual length. | Try `"closer"` with `"rescore"`. |
 
 The reading settings (`max_pixels`, `upscale`, `enhance`, `retry`, `postmark_guess`,
-`repetition_penalty`) are saved with each run, and Notebook 3 reads the test pages with exactly
+`repetition_penalty`, `cut_repeats`, `retry_pick`) are saved with each run, and Notebook 3 reads the test pages with exactly
 the chosen run's settings.
 
 ### Kade runs: held-out documents
@@ -204,6 +206,20 @@ and score them. They report each document, the score without the postmark line, 
 10 training pages. A `"kade"` run trains on Kade only for 5 epochs, scores every held-out page
 after each epoch, and keeps each epoch's adapter in `epoch1/` to `epoch5/`. Choose settings on
 split A, confirm on split B, and use the page-by-page comparison in Step 6 rather than the mean.
+
+### Survey runs, rescoring, and the final models
+
+- **`"survey-baseline"` and `"survey"`** do the same for the survey notes, on the usual 35 survey
+  dev pages. All survey pages come from one notebook, and Kaggle's hidden survey pages were picked
+  page by page from it, so these dev pages are a fair yardstick.
+- **`"rescore"`** scores a saved adapter (`ADAPTER`: a run folder, or one of its `epochN` folders)
+  with the reading settings in Step 4, on the same pages its run scored. Use it to test a reading
+  setting on a trained model without training again.
+- **`"kade-final"` and `"survey-final"`** train one collection on every training page, dev pages
+  included, for `FINAL_EPOCHS`. Freeze the settings first: their dev score means nothing, because
+  they trained on those pages.
+- **Notebook 3** reads each collection with the run you choose in `USE`, for example a
+  `"kade-final"` run for Kade, a `"survey-final"` run for the survey notes and a `"full"` run for Dominy.
 
 **Reading the scores.** The dev set is small: 11 Kade pages from one letter, 35 survey pages from
 one notebook, 9 Dominy pages. A difference of 0.01 to 0.02 may be luck; run the same settings

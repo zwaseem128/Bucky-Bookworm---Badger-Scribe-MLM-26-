@@ -260,6 +260,28 @@ def looks_wrong(text: str, expected_chars: float) -> bool:
     return expected_chars > 0 and len(t) < 0.25 * expected_chars
 
 
+def cut_at_repeat(text: str, n: int = 22) -> str:
+    """Cut a reading at the first line that repeats an n-character stretch written earlier.
+
+    An untrained model sometimes reads a letter correctly and then keeps going, writing
+    invented sentences until it runs out of room, often coming back to the same phrases.
+    Real labels almost never repeat 22 characters (none of the 88 held-out Kade pages do),
+    so the text from the first repeat on is very likely invented. Spaces and line breaks
+    are collapsed first, so a repeat split across lines still counts."""
+    lines = text.split("\n")
+    seen, flat = set(), ""
+    for i, line in enumerate(lines):
+        piece = " ".join(line.split())
+        joined = f"{flat} {piece}" if flat else piece
+        start = max(0, len(flat) - n + 1)           # the stretches that end in this line
+        windows = [joined[j:j + n] for j in range(start, len(joined) - n + 1)]
+        if any(w in seen for w in windows):
+            return "\n".join(lines[:i]).strip()
+        seen.update(windows)
+        flat = joined
+    return text
+
+
 def top_bottom(box, width, height, overlap=0.06):
     """The top and bottom halves of an image (or of one part of it), overlapping a little."""
     l, t, r, b = box if box else (0, 0, width, height)

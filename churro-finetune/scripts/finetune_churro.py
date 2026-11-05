@@ -56,18 +56,21 @@ from common import (  # noqa: E402
     augment,
     build_prompt,
     clean_output,
+    cut_at_repeat,
     full_messages,
     load_image,
     load_metadata,
     looks_wrong,
+    split_survey_label,
     top_bottom,
+    training_text,
     user_messages,
 )
 
 # How pages are read. Saved in summary.json, so reading the test pages later
 # (transcribe.py) works exactly the way the dev pages were scored.
 READING_SETTINGS = ("max_pixels", "max_new_tokens", "upscale", "enhance", "retry", "postmark_guess",
-                    "repetition_penalty")
+                    "repetition_penalty", "retry_pick", "cut_repeats", "repeat_chars")
 
 
 def without_postmark(text):
@@ -113,6 +116,16 @@ def parse_args():
     p.add_argument("--max_new_tokens", type=int, default=1536)
     p.add_argument("--repetition_penalty", type=float, default=1.05,
                    help="above 1.0 discourages repeating text; 1.0 = off")
+    p.add_argument("--retry_pick", default="longer", choices=("longer", "closer"),
+                   help="when both readings of a part look wrong, keep the longer one (as before), or the one "
+                        "whose length is closer to the usual length")
+    p.add_argument("--cut_repeats", default="",
+                   help="collections whose readings are cut where they start repeating themselves, e.g. kade_letters")
+    p.add_argument("--repeat_chars", type=int, default=22, help="how long a repeated stretch must be to cut there")
+    p.add_argument("--adapter_dir", default="",
+                   help="with --epochs 0: score this saved adapter (e.g. a run's epoch3 folder) instead of plain CHURRO")
+    p.add_argument("--train_on_dev", type=int, default=0,
+                   help="1 = also train on the dev pages (for the final model; its dev score then means nothing)")
     # --- which pages ---
     p.add_argument("--categories", default="all",
                    help="collections to train and score on: all, or a comma-separated list, e.g. kade_letters")
@@ -238,7 +251,14 @@ def read_pages(model, processor, page_ids, parts, data_dir, doc_ctx, categories,
             second = generate(model, processor, again, opts, batch)
             for key in {k for (k, _), *_ in again}:
                 joined = (second[(key, "top")] + "\n" + second[(key, "bottom")]).strip()
-                if not looks_wrong(joined, info[key]["expected"]) or len(joined) > len(texts[key]):
+                exp = info[key]["expected"]
+                if opts.get("retry_pick", "longer") == "closer" and exp > 0:
+                    # A reading stuck repeating is long, so "longer" would keep the worse one.
+                    off = lambda t: abs(math.log((len(" ".join(t.split())) + 1) / (exp + 1)))
+                    better = off(joined) < off(texts[key])
+                else:
+                    better = len(joined) > len(texts[key])
+                if not looks_wrong(joined, exp) or better:
                     texts[key] = joined
                     retried.add(key[0])
 
@@ -246,6 +266,8 @@ def read_pages(model, processor, page_ids, parts, data_dir, doc_ctx, categories,
     for pid in page_ids:
         keys = sorted(k for k in texts if k[0] == pid)
         text = clean_output("\n".join(texts[k] for k in keys), categories[pid])
+        if listed(opts.get("cut_repeats", ""), categories[pid]):
+            text = cut_at_repeat(text, int(opts.get("repeat_chars", 22)))
         if opts["postmark_guess"] and keys:
             w, h = info[keys[0]]["size"]
             text = add_postmark_guess(text, categories[pid], w, h)
@@ -400,6 +422,23 @@ def main():
         dev = dev[dev.category.map(lambda c: listed(args.categories, c))]
         if not len(items) and args.epochs > 0:
             raise SystemExit(f"No training images in collections '{args.categories}'.")
+    if args.train_on_dev:
+        if args.holdout_docs:
+            raise SystemExit("--train_on_dev and --holdout_docs don't go together: the held-out pages are the dev pages.")
+        extra = []
+        for r in dev.to_dict("records"):
+            prs = parts[parts.page_id == r["page_id"]].to_dict("records")
+            if not prs:
+                continue
+            text = training_text(r["text"], r["category"])
+            halves = split_survey_label(text) if len(prs) == 2 else None   # a survey spread, as in prepare_data.py
+            base = {"page_id": r["page_id"], "doc_id": r["doc_id"], "category": r["category"]}
+            if halves:
+                extra += [{**base, "image": p["image"], "box": p["box"], "text": h} for p, h in zip(prs, halves)]
+            else:
+                extra.append({**base, "image": prs[0]["image"], "box": "", "text": text})
+        items = pd.concat([items, pd.DataFrame(extra)], ignore_index=True)
+        print(f"also training on the {len(dev)} dev pages ({len(extra)} images)", flush=True)
     trained_on = sorted(set(items.page_id))
     if args.max_train_items:
         items = per_category(items, lambda g: g.sample(min(len(g), max(1, args.max_train_items // 3)),
@@ -412,13 +451,16 @@ def main():
     print(f"training images per epoch: {len(items)} ({', '.join(f'{c} {n}' for c, n in items.category.value_counts().items())}); "
           f"dev pages: {len(dev)}", flush=True)
 
-    model, processor, dtype = load_model(args.model_id, args.max_pixels)
+    if args.adapter_dir and args.epochs > 0:
+        raise SystemExit("--adapter_dir only scores a saved adapter; use it with --epochs 0.")
+    model, processor, dtype = load_model(args.model_id, args.max_pixels, args.adapter_dir or None)
     summary = {"model_id": args.model_id, "epochs": args.epochs, "lr": args.lr, "lora_r": args.lora_r,
                "lora_alpha": args.lora_alpha, "train_vision": args.train_vision, "augment": args.augment,
                "oversample": args.oversample, "effective_batch": args.batch_size * args.grad_accum,
                "train_images_per_epoch": len(items), "dev_pages": len(dev),
                "categories": args.categories, "holdout_docs": args.holdout_docs,
-               "trained_on_docs": sorted(set(items.doc_id)),
+               "trained_on_docs": sorted(set(items.doc_id)), "adapter_dir": args.adapter_dir,
+               "train_on_dev": args.train_on_dev,
                "dtype": str(dtype).replace("torch.", ""), "reading": opts}
     curve, loss_log = [], []
 
@@ -506,6 +548,10 @@ def main():
                                    "too long": int((g.problem == "too long").sum()),
                                    "read twice": int(g.read_twice.sum()), "pages": len(g)}
                                for c, g in scores.groupby("category")}
+    if len(curve) > 1:
+        best = min(curve, key=lambda p: p["mean"])
+        summary["best_epoch"] = best["epoch"]
+        summary["best_epoch_dev_cer"] = best["mean"]
     with open(os.path.join(args.out_dir, "curve.json"), "w") as f:
         json.dump({"dev_cer_by_epoch": curve, "loss": loss_log}, f, indent=2)
     with open(os.path.join(args.out_dir, "summary.json"), "w") as f:

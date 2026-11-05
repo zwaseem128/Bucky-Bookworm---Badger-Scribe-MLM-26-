@@ -35,14 +35,20 @@ def main():
     p.add_argument("--model_id", default=None, help="default: the run's model")
     p.add_argument("--batch", type=int, default=4, help="images read at once")
     p.add_argument("--chunk", type=int, default=12, help="pages read between saves")
+    p.add_argument("--categories", default="all", help="only read pages of these collections, e.g. kade_letters")
     args = p.parse_args()
 
     summary = json.load(open(os.path.join(args.run_dir, "summary.json")))
     opts = summary["reading"]
-    has_adapter = os.path.exists(os.path.join(args.run_dir, "adapter_config.json"))
+    # The run's own adapter, or, for a run that rescored a saved adapter, that one.
+    adapter = args.run_dir if os.path.exists(os.path.join(args.run_dir, "adapter_config.json")) \
+        else summary.get("adapter_dir") or None
     print(f"reading as run {os.path.basename(args.run_dir)} scored its dev pages: {opts}", flush=True)
 
     pages = list(pd.read_csv(args.pages, keep_default_na=False, encoding="utf-8-sig")["page_id"])
+    if args.categories != "all":
+        wanted = {c.strip() for c in args.categories.split(",")}
+        pages = [pid for pid in pages if category_of(pid) in wanted]
     done = set(pd.read_csv(args.out, keep_default_na=False)["page_id"]) if os.path.exists(args.out) else set()
     todo = [pid for pid in pages if pid not in done]
     print(f"{len(pages)} pages, {len(done)} already done, {len(todo)} to do", flush=True)
@@ -54,7 +60,7 @@ def main():
     expected = json.load(open(expected_path)) if os.path.exists(expected_path) else {}
     doc_ctx = load_metadata(os.path.join(args.data_dir, "metadata.csv"))
     model, processor, _ = load_model(args.model_id or summary["model_id"], opts["max_pixels"],
-                                     args.run_dir if has_adapter else None)
+                                     adapter)
     new = not os.path.exists(args.out)
     start, read_twice = time.time(), 0
     with open(args.out, "a", newline="", encoding="utf-8") as f:
