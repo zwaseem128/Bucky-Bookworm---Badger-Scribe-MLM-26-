@@ -70,7 +70,8 @@ from common import (  # noqa: E402
 # How pages are read. Saved in summary.json, so reading the test pages later
 # (transcribe.py) works exactly the way the dev pages were scored.
 READING_SETTINGS = ("max_pixels", "max_new_tokens", "upscale", "enhance", "retry", "postmark_guess",
-                    "repetition_penalty", "retry_pick", "cut_repeats", "repeat_chars")
+                    "repetition_penalty", "retry_pick", "cut_repeats", "repeat_chars",
+                    "no_repeat_ngram_size", "retry_repetition_penalty", "compare_adapter", "compare_ratio")
 
 
 def without_postmark(text):
@@ -122,6 +123,19 @@ def parse_args():
     p.add_argument("--cut_repeats", default="",
                    help="collections whose readings are cut where they start repeating themselves, e.g. kade_letters")
     p.add_argument("--repeat_chars", type=int, default=22, help="how long a repeated stretch must be to cut there")
+    p.add_argument("--no_repeat_ngram_size", type=int, default=0,
+                   help="never write the same run of this many tokens twice (0 = off; try 10 or more, since short "
+                        "runs like 'u. die' really do repeat in a letter)")
+    p.add_argument("--retry_repetition_penalty", type=float, default=0.0,
+                   help="repetition penalty for the second reading of a part that looked wrong (0 = same as the first)")
+    p.add_argument("--compare_adapter", default="",
+                   help="with --epochs 0: also read every page with this second adapter (e.g. another epoch), and "
+                        "keep its reading when the main one is much longer (a runaway)")
+    p.add_argument("--compare_ratio", type=float, default=1.5,
+                   help="how many times longer the main reading must be before the compare reading is kept")
+    p.add_argument("--init_adapter", default="",
+                   help="start training from this saved adapter (e.g. a run's epoch3) instead of a new one, "
+                        "with a fresh learning-rate schedule")
     p.add_argument("--adapter_dir", default="",
                    help="with --epochs 0: score this saved adapter (e.g. a run's epoch3 folder) instead of plain CHURRO")
     p.add_argument("--train_on_dev", type=int, default=0,
@@ -174,8 +188,9 @@ def check_cudnn(dtype):
               "a little slower. The conda_pytorch_p310 kernel avoids this.", flush=True)
 
 
-def load_model(model_id, max_pixels, adapter_dir=None):
-    """CHURRO-3B (and an adapter on top, if given) on the GPU, with its processor."""
+def load_model(model_id, max_pixels, adapter_dir=None, compare_dir=None):
+    """CHURRO-3B (and an adapter on top, if given) on the GPU, with its processor.
+    compare_dir loads a second adapter beside the first, named "compare"."""
     from peft import PeftModel
     from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
@@ -188,6 +203,12 @@ def load_model(model_id, max_pixels, adapter_dir=None):
     if adapter_dir:
         print(f"adding the adapter in {adapter_dir}", flush=True)
         model = PeftModel.from_pretrained(model, adapter_dir)
+    if compare_dir:
+        if not adapter_dir:
+            raise SystemExit("compare_adapter needs a main adapter to compare with (adapter_dir).")
+        print(f"adding a second adapter to compare with, from {compare_dir}", flush=True)
+        model.load_adapter(compare_dir, adapter_name="compare")
+        model.set_adapter("default")
     return model.eval(), processor, dtype
 
 
@@ -199,7 +220,7 @@ def parse_box(box):
 
 
 @torch.no_grad()
-def generate(model, processor, jobs, opts, batch):
+def generate(model, processor, jobs, opts, batch, penalty=None):
     """Read a list of images: jobs are (key, image path, box, prompt, category). Returns {key: text}."""
     out_texts = {}
     jobs = sorted(jobs, key=lambda j: (j[2] is not None, j[3]))   # similar images together: less padding
@@ -212,7 +233,8 @@ def generate(model, processor, jobs, opts, batch):
                   for j in chunk]
         enc = processor(text=texts, images=images, padding=True, return_tensors="pt").to(model.device)
         out = model.generate(**enc, max_new_tokens=opts["max_new_tokens"], do_sample=False,
-                             repetition_penalty=opts.get("repetition_penalty", 1.05), use_cache=True)
+                             repetition_penalty=penalty or opts.get("repetition_penalty", 1.05),
+                             no_repeat_ngram_size=int(opts.get("no_repeat_ngram_size", 0) or 0), use_cache=True)
         for j, text in zip(chunk, processor.batch_decode(out[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)):
             out_texts[j[0]] = text.strip()
     processor.tokenizer.padding_side = "right"
@@ -248,7 +270,7 @@ def read_pages(model, processor, page_ids, parts, data_dir, doc_ctx, categories,
                 for half, half_box in zip(("top", "bottom"), top_bottom(box, w, h)):
                     again.append(((key, half), path, half_box, prompt, cat))
         if again:
-            second = generate(model, processor, again, opts, batch)
+            second = generate(model, processor, again, opts, batch, opts.get("retry_repetition_penalty") or None)
             for key in {k for (k, _), *_ in again}:
                 joined = (second[(key, "top")] + "\n" + second[(key, "bottom")]).strip()
                 exp = info[key]["expected"]
@@ -261,6 +283,19 @@ def read_pages(model, processor, page_ids, parts, data_dir, doc_ctx, categories,
                 if not looks_wrong(joined, exp) or better:
                     texts[key] = joined
                     retried.add(key[0])
+
+    if opts.get("compare_adapter"):
+        # A second reading with another adapter (e.g. another epoch). Two adapters rarely run away
+        # on the same page, so when the main reading is much longer, it is most likely the runaway.
+        model.set_adapter("compare")
+        other = generate(model, processor, jobs, opts, batch)
+        model.set_adapter("default")
+        ratio = float(opts.get("compare_ratio", 1.5))
+        for key in texts:
+            a, b = len(" ".join(texts[key].split())), len(" ".join(other[key].split()))
+            if b > 0 and a > ratio * b:
+                texts[key] = other[key]
+                retried.add(key[0])
 
     result = {}
     for pid in page_ids:
@@ -452,15 +487,32 @@ def main():
           f"dev pages: {len(dev)}", flush=True)
 
     if args.adapter_dir and args.epochs > 0:
-        raise SystemExit("--adapter_dir only scores a saved adapter; use it with --epochs 0.")
-    model, processor, dtype = load_model(args.model_id, args.max_pixels, args.adapter_dir or None)
+        raise SystemExit("--adapter_dir only scores a saved adapter; use it with --epochs 0. "
+                         "To train further from an adapter, use --init_adapter.")
+    if args.compare_adapter and args.epochs > 0:
+        raise SystemExit("--compare_adapter is for scoring (--epochs 0), not training.")
+    if args.init_adapter:
+        if args.epochs <= 0:
+            raise SystemExit("--init_adapter starts training from an adapter; it needs --epochs above 0.")
+        if not os.path.exists(os.path.join(args.init_adapter, "adapter_config.json")):
+            raise SystemExit(f"No adapter in {args.init_adapter}")
+        if args.train_vision:
+            raise SystemExit("--train_vision 1 changes which layers the adapter has, so it can't continue a saved "
+                             "adapter. Start a fresh run for it (no --init_adapter).")
+    if args.epochs > 0 and os.path.exists(os.path.join(args.out_dir, "summary.json")):
+        # A finished run. Launching it again used to "resume" from its last checkpoint, train for
+        # 0 minutes, and overwrite its summary and curve with empty ones.
+        raise SystemExit(f"This run already finished ({args.out_dir}). Its results are kept. To train again, "
+                         "change a setting, or delete the folder to start it over.")
+    model, processor, dtype = load_model(args.model_id, args.max_pixels, args.adapter_dir or None,
+                                         args.compare_adapter or None)
     summary = {"model_id": args.model_id, "epochs": args.epochs, "lr": args.lr, "lora_r": args.lora_r,
                "lora_alpha": args.lora_alpha, "train_vision": args.train_vision, "augment": args.augment,
                "oversample": args.oversample, "effective_batch": args.batch_size * args.grad_accum,
                "train_images_per_epoch": len(items), "dev_pages": len(dev),
                "categories": args.categories, "holdout_docs": args.holdout_docs,
                "trained_on_docs": sorted(set(items.doc_id)), "adapter_dir": args.adapter_dir,
-               "train_on_dev": args.train_on_dev,
+               "train_on_dev": args.train_on_dev, "init_adapter": args.init_adapter,
                "dtype": str(dtype).replace("torch.", ""), "reading": opts}
     curve, loss_log = [], []
 
@@ -473,9 +525,16 @@ def main():
         # also on the image encoder's ("visual") blocks.
         layers = "q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj"
         target = rf".*\.(?:{layers}|qkv|attn\.proj)$" if args.train_vision else rf"^(?!.*visual).*\.(?:{layers})$"
-        model = get_peft_model(model, LoraConfig(r=args.lora_r, lora_alpha=args.lora_alpha,
-                                                 lora_dropout=args.lora_dropout, bias="none",
-                                                 task_type="CAUSAL_LM", target_modules=target))
+        if args.init_adapter:
+            # Carry on from what a saved adapter already knows. Its layers and size come from the
+            # saved adapter, so lora_r, lora_alpha and train_vision don't apply.
+            from peft import PeftModel
+            print(f"training on from the adapter in {args.init_adapter}", flush=True)
+            model = PeftModel.from_pretrained(model, args.init_adapter, is_trainable=True)
+        else:
+            model = get_peft_model(model, LoraConfig(r=args.lora_r, lora_alpha=args.lora_alpha,
+                                                     lora_dropout=args.lora_dropout, bias="none",
+                                                     task_type="CAUSAL_LM", target_modules=target))
         model.enable_input_require_grads()
         model.print_trainable_parameters()
 

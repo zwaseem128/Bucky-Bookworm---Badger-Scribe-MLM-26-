@@ -215,6 +215,17 @@ split A, confirm on split B, and use the page-by-page comparison in Step 6 rathe
 - **`"rescore"`** scores a saved adapter (`ADAPTER`: a run folder, or one of its `epochN` folders)
   with the reading settings in Step 4, on the same pages its run scored. Use it to test a reading
   setting on a trained model without training again.
+- **`"kade-more"` and `"kade-survey"`** train on from a saved adapter (`INIT_ADAPTER`, e.g. a
+  `kadeA` run's `epoch3`) with a new, gentle learning-rate schedule, instead of starting over.
+  `"kade-more"` adds kade_007 (lr 5e-5); `"kade-survey"` adds kade_007 and the survey notes
+  (lr 1e-4). Both hold out kade_112, which is only 11 small postcards, so judge them page by page.
+  A finished run can't be launched again: it used to "resume" for 0 minutes and overwrite its
+  summary, so now it's refused.
+- **More reading fixes for `"rescore"`**, all off by default: `no_repeat_ngram_size` (try 12),
+  `retry_repetition_penalty` (try 1.15) for the second reading of a part, and `compare_adapter`, a
+  second adapter (e.g. another epoch) whose reading is kept when the main one is over 1.5 times
+  longer. That catches runaways on short pages, which a length check can't, since it has no label
+  to compare with. It reads every page twice, so it takes twice as long.
 - **`"kade-final"` and `"survey-final"`** train one collection on every training page, dev pages
   included, for `FINAL_EPOCHS`. Freeze the settings first: their dev score means nothing, because
   they trained on those pages.

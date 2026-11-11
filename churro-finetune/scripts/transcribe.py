@@ -60,7 +60,7 @@ def main():
     expected = json.load(open(expected_path)) if os.path.exists(expected_path) else {}
     doc_ctx = load_metadata(os.path.join(args.data_dir, "metadata.csv"))
     model, processor, _ = load_model(args.model_id or summary["model_id"], opts["max_pixels"],
-                                     adapter)
+                                     adapter, opts.get("compare_adapter") or None)
     new = not os.path.exists(args.out)
     start, read_twice = time.time(), 0
     with open(args.out, "a", newline="", encoding="utf-8") as f:
