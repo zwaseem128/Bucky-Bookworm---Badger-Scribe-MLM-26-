@@ -177,7 +177,7 @@ scores in the team's results table.
 
 | Setting | Starts at | In plain words | Change it when |
 |---|---|---|---|
-| `epochs` | 2 | How many times training goes through all the images. The lesson saw small gains up to 3. | The curve after each epoch is still falling: try 3. |
+| `epochs` | 3 | How many times training goes through all the images. The lesson saw small gains up to 3. The per-collection runs set their own (`"kade"` 5, `"survey"` 3, `"dominy"` 4). | The curve after each epoch is still falling: try more. |
 | `lr` | `2e-4` | How big each correction is. | Scores get worse after epoch 1: try `1e-4`. |
 | `lora_r`, `lora_alpha` | 16, 32 | How big and how strong the adapter is. Keep alpha at twice r. | Training loss stays high: try 32 and 64. |
 | `grad_accum` | 8 | How many images it sees before each correction. | Rarely. |
@@ -190,10 +190,11 @@ scores in the team's results table.
 | `retry` | 1 | Reads a part again, top and bottom separately, when its first reading is empty, far too short, or stuck repeating (problems 1 and 7). | Set 0 to measure it. |
 | `postmark_guess` | 1 | Adds `Postmark , 19` on small Kade cards (problem 3). | Set 0 if the team decides against it. |
 | `repetition_penalty` | 1.05 | Discourages the model from writing the same text twice. It can also penalise words a letter really repeats. | Try 1.0: no retraining needed, use `"kade-baseline"` or a finished run's settings. |
+| `max_new_tokens` | 2500 | The longest reading allowed, in tokens. The script's own default of 1536 can cut off long Dominy ledger pages. | A reading ends mid-page with no repeating: raise it. |
 | `cut_repeats` | `""` | Cuts a reading where it starts repeating a 22-character stretch it already wrote, for the named collections. Untrained CHURRO often reads a letter correctly, then keeps inventing text. On the 88 held-out Kade pages this took the untrained score from 0.327 to 0.266; it cost two pages about 0.2 each. | Try `"kade_letters"` with `"rescore"` on a trained adapter. Don't use it on survey notes without testing: their tables repeat on purpose. |
 | `retry_pick` | `"longer"` | When both readings of a part look wrong, which to keep. `"longer"` was the original rule, but a reading stuck repeating is the long one; `"closer"` keeps the one whose length is closer to the usual length. | Try `"closer"` with `"rescore"`. |
 
-The reading settings (`max_pixels`, `upscale`, `enhance`, `retry`, `postmark_guess`,
+The reading settings (`max_pixels`, `max_new_tokens`, `upscale`, `enhance`, `retry`, `postmark_guess`,
 `repetition_penalty`, `cut_repeats`, `retry_pick`) are saved with each run, and Notebook 3 reads the test pages with exactly
 the chosen run's settings.
 
