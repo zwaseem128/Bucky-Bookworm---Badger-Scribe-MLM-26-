@@ -76,13 +76,29 @@ time; reading several at once is faster). Your smoke run gives the real speed.
 
 Create a notebook instance in the SageMaker console (Notebooks → Create notebook instance):
 
-- **Instance type:** `ml.g5.xlarge` (or `ml.g6.xlarge`).
+- **Instance type:** `ml.t3.medium`, a small CPU instance that costs a few cents an hour. The
+  GPU work goes to training jobs (below). Use `ml.g5.xlarge` (or `ml.g6.xlarge`) only if you want
+  to run on the notebook's own GPU with `WHERE = "here"`.
 - **Volume size** (under Additional configuration): **50 GB**. The default 5 GB can't hold the
-  model and the images.
+  images (and, with `WHERE = "here"`, the model).
 - **IAM role:** the class role.
 
-If it fails with a **quota** message, ask the class organisers, or request
-"ml.g5.xlarge for notebook instance usage" under Service Quotas → Amazon SageMaker.
+Already have a g5 notebook? Stop it, choose **Edit**, change the instance type to `ml.t3.medium`,
+then **Update** and **Start**. Your files under `~/SageMaker` are kept.
+
+**Training jobs: paying for the GPU only while it works.** With `WHERE = "job"` (the default in
+Notebooks 2 and 3), each run is sent to a **SageMaker training job**: a separate `ml.g5.xlarge`
+that starts for that run and shuts down when it ends, so you are billed only for the run itself,
+plus 5 to 10 minutes of start-up. `scripts/sagemaker_job.py` copies the data and any adapter the
+run needs to your bucket (only what's new), and the run's folder is copied to
+`s3://<bucket>/churro-work/runs/<run>` as it goes and back to the notebook when it ends. So the
+notebooks' later steps, and Notebook 3, work exactly as before. The job keeps running if you
+close the browser or stop the notebook instance. If a job fails at once with a **quota** message,
+request "ml.g5.xlarge for training job usage" under Service Quotas → Amazon SageMaker (it is a
+separate quota from notebook instances).
+
+If creating the notebook fails with a **quota** message, ask the class organisers, or request
+the quota for that instance type "for notebook instance usage" under Service Quotas → Amazon SageMaker.
 
 **It bills every hour it's running, even with the browser closed. Stop it when you're done**
 (Notebooks → select it → Actions → Stop). Your files under `~/SageMaker` survive a stop.
