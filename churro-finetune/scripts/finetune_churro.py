@@ -92,6 +92,11 @@ READING_SETTINGS = ("max_pixels", "max_new_tokens", "upscale", "enhance", "retry
 # page isn't turned: a short reading of it stopped early, which the ink check handles.
 ROTATE_BELOW_CHARS = 250
 ROTATE_BELOW_INK = 350
+# A turned reading may be this long at most. Only pages with under 700 characters' worth of ink
+# are turned (about 300 tokens), and an untrained model reading a page the wrong way up tends to
+# write until it is stopped: at the full limit, three turned readings of every short page made
+# the first scoring pass of a run take over 20 minutes.
+TURNED_MAX_TOKENS = 400
 
 
 def without_postmark(text):
@@ -259,12 +264,13 @@ def flat_len(text):
 
 
 @torch.no_grad()
-def generate(model, processor, jobs, opts, batch, penalty=None, sureness=None):
+def generate(model, processor, jobs, opts, batch, penalty=None, sureness=None, max_tokens=None):
     """Read a list of images: jobs are (key, image path, box, prompt, category) and, optionally,
     a rotation in degrees. Returns {key: text}.
 
     sureness, if given, is a dict that gets {key: the mean log-probability of the tokens written}:
-    how sure the model was of this reading. 0 is certain; a guess is well below."""
+    how sure the model was of this reading. 0 is certain; a guess is well below.
+    max_tokens, if given, replaces the run's max_new_tokens for these readings."""
     out_texts = {}
     jobs = sorted(jobs, key=lambda j: (j[2] is not None, j[3]))   # similar images together: less padding
     processor.tokenizer.padding_side = "left"
@@ -298,7 +304,7 @@ def generate(model, processor, jobs, opts, batch, penalty=None, sureness=None):
         if sureness is not None:
             watch = Sureness()
             extra = {"logits_processor": LogitsProcessorList([watch])}
-        out = model.generate(**enc, max_new_tokens=opts["max_new_tokens"], do_sample=False,
+        out = model.generate(**enc, max_new_tokens=int(max_tokens or opts["max_new_tokens"]), do_sample=False,
                              repetition_penalty=penalty or opts.get("repetition_penalty", 1.05),
                              no_repeat_ngram_size=int(opts.get("no_repeat_ngram_size", 0) or 0), use_cache=True,
                              **extra)
@@ -358,7 +364,8 @@ def read_pages(model, processor, page_ids, parts, data_dir, doc_ctx, categories,
                  and (flat_len(texts[key]) < ROTATE_BELOW_CHARS or info[key]["ink"] < ROTATE_BELOW_INK)
                  for deg in (90, 180, 270)]
         if again:
-            other = generate(model, processor, again, opts, batch, sureness=sure)
+            other = generate(model, processor, again, opts, batch, sureness=sure,
+                             max_tokens=min(int(opts["max_new_tokens"]), TURNED_MAX_TOKENS))
             margin = float(opts.get("rotation_margin", 0.1))
             for key in sorted({j[0][0] for j in again}):
                 best, best_score = 0, (sure[key] if texts[key].strip() else float("-inf"))
