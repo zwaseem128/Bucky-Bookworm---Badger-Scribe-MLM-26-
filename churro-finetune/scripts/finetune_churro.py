@@ -644,8 +644,10 @@ def main():
         print(f"held out: {', '.join(f'{d} ({n} pages)' for d, n in held_pages.doc_id.value_counts().sort_index().items())}",
               flush=True)
     if args.categories != "all":
-        items = items[items.category.map(lambda c: listed(args.categories, c))]
-        dev = dev[dev.category.map(lambda c: listed(args.categories, c))]
+        # .astype(bool): with no rows left (every document held out), map() gives an empty column
+        # that isn't true/false, and pandas would take it as "no columns".
+        items = items[items.category.map(lambda c: listed(args.categories, c)).astype(bool)]
+        dev = dev[dev.category.map(lambda c: listed(args.categories, c)).astype(bool)]
         if not len(items) and args.epochs > 0:
             raise SystemExit(f"No training images in collections '{args.categories}'.")
     if args.train_on_dev:

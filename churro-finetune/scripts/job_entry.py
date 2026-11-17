@@ -13,6 +13,7 @@ output folder (like `tee -a` in the notebook), so it reaches S3 while the job ru
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -28,6 +29,15 @@ def main():
         if not os.path.lexists(local):
             os.symlink(target, local)
         print(f"{local} -> {target}", flush=True)
+
+    # The 7.5 GB model download goes wherever the job has most room (its storage volume holds
+    # /tmp and /opt/ml; the container's own disk can be small). Not under checkpoints, model or
+    # output, which SageMaker copies to S3.
+    if "HF_HOME" not in os.environ and os.path.isdir("/opt/ml"):
+        roomiest = max(("/tmp", "/opt/ml", os.path.expanduser("~")),
+                       key=lambda d: shutil.disk_usage(d).free if os.path.isdir(d) else -1)
+        os.environ["HF_HOME"] = os.path.join(roomiest, "hf_cache")
+        print(f"model downloads -> {os.environ['HF_HOME']}", flush=True)
 
     here = os.path.dirname(os.path.abspath(__file__))
     script = os.path.join(here, os.environ["CHURRO_SCRIPT"])
