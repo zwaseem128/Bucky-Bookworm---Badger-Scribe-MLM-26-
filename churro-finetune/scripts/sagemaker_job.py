@@ -16,6 +16,14 @@ How it works, so that nothing else in the notebooks has to change:
   so the scripts' arguments, and the paths written into summary.json, are the same in both places.
 - When the job ends, its results are copied back into the same folder on the notebook (without
   the large checkpoint files), so the notebooks' later steps read them as if they ran locally.
+
+The workshop account's guard rails (the WorkshopGuardRails policy on the ml-sagemaker-use role;
+scripts/guardrails.json in carpentries-incubator/ML_with_AWS_SageMaker) refuse a job unless it
+carries three tags: Project (one of the workshop's projects), Purpose, and Name (who started it).
+The refusal is an AccessDeniedException "with an explicit deny in an identity-based policy" that
+names neither the rule nor the fix. So every job is tagged Project = BadgerScribe, Purpose =
+Training and Name = the name saved in churro-work/my_settings.json. They also allow only
+single-GPU instance types (ml.g4dn/g5/g6/g6e.xlarge, ml.g6e.2xlarge) and at most 48 hours.
 """
 
 import glob
@@ -112,13 +120,41 @@ def _sdk():
     return sagemaker
 
 
+PROJECT = "BadgerScribe"   # the workshop's name for this project; the account accepts only its own list
+ALLOWED_INSTANCES = ("ml.t3.medium", "ml.m5.large", "ml.m5.xlarge", "ml.g4dn.xlarge", "ml.g5.xlarge",
+                     "ml.g6.xlarge", "ml.g6e.xlarge", "ml.g6e.2xlarge")
+
+
+def _owner(work, owner=""):
+    """The Name tag: who started the job. Given, or saved once as "name" in churro-work/my_settings.json."""
+    if not owner:
+        try:
+            owner = json.load(open(os.path.join(work, "my_settings.json"))).get("name", "")
+        except (OSError, ValueError):
+            owner = ""
+    owner = re.sub(r"[^A-Za-z0-9 _.:/=+@-]", "", str(owner)).strip()   # the characters a tag may hold
+    if not owner:
+        raise SystemExit(
+            'The workshop account only starts a job that is tagged with your name. Save it once: in a new '
+            'cell, run\n\n    save_setting("name", "DoeJohn")\n\nwith your own last and first name run '
+            'together in place of DoeJohn, then run this cell again.')
+    return owner
+
+
 def run_job(script, args, out_folder, *, work, bucket, run_name, instance_type="ml.g5.xlarge",
-            max_hours=6, spot=False, owner="", log_name="job.log", wait=True):
+            max_hours=6, spot=False, owner="", purpose="Training", log_name="job.log", wait=True):
     """Run scripts/<script> with --<key> <value> for each of args, in a training job on instance_type.
 
     out_folder is the churro-work folder the script writes to. Returns the job's name."""
     if not bucket:
         raise SystemExit("No bucket saved. Run Notebook 1, Step 2 first (it saves your bucket name).")
+    # The account's rules, checked here because its refusal doesn't say which one was broken.
+    owner = _owner(work, owner)
+    if instance_type not in ALLOWED_INSTANCES:
+        raise SystemExit(f"The workshop account doesn't allow {instance_type} for jobs. Use one of: "
+                         + ", ".join(i for i in ALLOWED_INSTANCES if ".g" in i) + ".")
+    if max_hours > 48:
+        raise SystemExit("The workshop account refuses jobs allowed to run over 48 hours; set JOB_HOURS to 48 or less.")
     sagemaker = _sdk()
     from sagemaker.huggingface import HuggingFace
 
@@ -138,7 +174,8 @@ def run_job(script, args, out_folder, *, work, bucket, run_name, instance_type="
     job_name = f"churro-{slug}-{time.strftime('%m%d-%H%M%S')}"
     environment = {"CHURRO_SCRIPT": script, "CHURRO_OUT": out_folder, "CHURRO_LOG": log_name,
                    **{f"CHURRO_LINK_{c}": r for c, r in channels.items()}}
-    tags = [{"Key": "Project", "Value": "BadgerScribe"}] + ([{"Key": "Name", "Value": owner}] if owner else [])
+    tags = [{"Key": "Project", "Value": PROJECT}, {"Key": "Purpose", "Value": purpose},
+            {"Key": "Name", "Value": owner}]
     estimator = HuggingFace(
         entry_point="job_entry.py",
         source_dir=_stage_code(work),

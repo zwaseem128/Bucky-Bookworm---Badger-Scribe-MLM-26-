@@ -292,6 +292,12 @@ closely the model copies the drafting model.
 
 ## Troubleshooting
 
+**A job is refused with `AccessDeniedException ... with an explicit deny in an identity-based
+policy`.** The workshop account only starts jobs tagged with `Project`, `Purpose` and `Name`. The
+launcher adds all three; `Name` is your name, saved once with `save_setting("name", "DoeJohn")`
+(your own last and first name run together). It also allows only single-GPU instance types and
+at most 48 hours. The launcher checks these before it starts a job and says which one is wrong.
+
 | What you see | What to do |
 |---|---|
 | `No module named 'PIL'` (or `'torch'`) | Wrong kernel. Kernel → Change Kernel → conda_pytorch_p310, then run from Step 1. |
