@@ -23,6 +23,15 @@ audit problem (docs/dev-set-error-audit.md on lokesh/data-dev-set):
  8. Survey vocabulary: learned from the 365 survey training images.
  9. Machine-drafted labels: scores on expert-typed pages are reported apart.
 
+10. Dominy backs (a third of its test pages): an address or docket written sideways or
+    upside down on an otherwise blank sheet. Short readings are redone at the other three
+    rotations and the reading the model is surest of is kept (--rotations); training
+    images are turned at random so the model learns to read them (--rotate_train); the
+    catalog's creator and summary, which name the people, join the prompt (--rich_context).
+11. Dense Dominy ledgers that stop early: the amount of ink on the page says how much
+    text to expect, and a reading far below it is redone in halves, twice if need be
+    (--ink_check).
+
 --epochs 0 only scores the dev pages with the model as it is (a baseline).
 
 Everything it writes goes to --out_dir:
@@ -49,6 +58,7 @@ from torch.utils.data import Dataset
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import (  # noqa: E402
+    DENSE_CHARS,
     MAX_PIXELS,
     MIN_PIXELS,
     MODEL_ID,
@@ -58,10 +68,13 @@ from common import (  # noqa: E402
     clean_output,
     cut_at_repeat,
     full_messages,
+    ink_chars,
+    join_halves,
     load_image,
     load_metadata,
     looks_wrong,
     split_survey_label,
+    stopped_early,
     top_bottom,
     training_text,
     user_messages,
@@ -71,7 +84,14 @@ from common import (  # noqa: E402
 # (transcribe.py) works exactly the way the dev pages were scored.
 READING_SETTINGS = ("max_pixels", "max_new_tokens", "upscale", "enhance", "retry", "postmark_guess",
                     "repetition_penalty", "retry_pick", "cut_repeats", "repeat_chars",
-                    "no_repeat_ngram_size", "retry_repetition_penalty", "compare_adapter", "compare_ratio")
+                    "no_repeat_ngram_size", "retry_repetition_penalty", "compare_adapter", "compare_ratio",
+                    "rotations", "rotation_margin", "ink_check", "rich_context")
+
+# --rotations: a reading shorter than this, or a page with less ink than this many characters,
+# is also read at 90, 180 and 270 degrees. Every labelled Dominy back is under both. A dense
+# page isn't turned: a short reading of it stopped early, which the ink check handles.
+ROTATE_BELOW_CHARS = 250
+ROTATE_BELOW_INK = 350
 
 
 def without_postmark(text):
@@ -106,6 +126,9 @@ def parse_args():
                                                      "all, none, or a comma-separated list")
     p.add_argument("--oversample", default="dominy_accounts:4",
                    help="collections whose training images are used several times per epoch, e.g. dominy_accounts:4")
+    p.add_argument("--rotate_train", default="",
+                   help="collections whose training images are turned by 90, 180 or 270 degrees half the time, "
+                        "so the model learns to read sideways and upside-down writing, e.g. dominy_accounts")
     p.add_argument("--max_train_items", type=int, default=0, help="0 = all; small for a smoke test")
     p.add_argument("--use_metadata", type=int, default=1)
     # --- reading (training and scoring alike) ---
@@ -133,6 +156,17 @@ def parse_args():
                         "keep its reading when the main one is much longer (a runaway)")
     p.add_argument("--compare_ratio", type=float, default=1.5,
                    help="how many times longer the main reading must be before the compare reading is kept")
+    p.add_argument("--rotations", default="",
+                   help="collections whose short readings are redone at 90, 180 and 270 degrees, keeping the "
+                        "reading the model is surest of, e.g. dominy_accounts")
+    p.add_argument("--rotation_margin", type=float, default=0.1,
+                   help="how much surer (mean log-probability per token) a turned reading must be to replace "
+                        "the upright one")
+    p.add_argument("--ink_check", default="",
+                   help="collections where 'stopped early' is judged from the ink on the page instead of the "
+                        "collection's usual length, and such pages are redone in halves, e.g. dominy_accounts")
+    p.add_argument("--rich_context", default="",
+                   help="collections whose prompt also gets the catalog's creator and summary, e.g. dominy_accounts")
     p.add_argument("--init_adapter", default="",
                    help="start training from this saved adapter (e.g. a run's epoch3) instead of a new one, "
                         "with a fresh learning-rate schedule")
@@ -219,53 +253,129 @@ def parse_box(box):
     return tuple(int(v) for v in box.split(",")) if isinstance(box, str) and box else None
 
 
+def flat_len(text):
+    return len(" ".join(str(text).split()))
+
+
 @torch.no_grad()
-def generate(model, processor, jobs, opts, batch, penalty=None):
-    """Read a list of images: jobs are (key, image path, box, prompt, category). Returns {key: text}."""
+def generate(model, processor, jobs, opts, batch, penalty=None, sureness=None):
+    """Read a list of images: jobs are (key, image path, box, prompt, category) and, optionally,
+    a rotation in degrees. Returns {key: text}.
+
+    sureness, if given, is a dict that gets {key: the mean log-probability of the tokens written}:
+    how sure the model was of this reading. 0 is certain; a guess is well below."""
     out_texts = {}
     jobs = sorted(jobs, key=lambda j: (j[2] is not None, j[3]))   # similar images together: less padding
     processor.tokenizer.padding_side = "left"
+    extra, stops = {}, set()
+    if sureness is not None:
+        from transformers import LogitsProcessor, LogitsProcessorList
+
+        class Sureness(LogitsProcessor):
+            """Notes, at every step, the log-probability of the token greedy reading is about to pick."""
+
+            def __init__(self):
+                self.steps = []
+
+            def __call__(self, input_ids, scores):
+                self.steps.append(torch.log_softmax(scores.float(), dim=-1).max(dim=-1).values.cpu())
+                return scores
+
+        for cfg in (getattr(model, "generation_config", None), processor.tokenizer):
+            for name in ("eos_token_id", "pad_token_id"):
+                ids = getattr(cfg, name, None)
+                stops.update(ids if isinstance(ids, (list, tuple)) else [ids])
+        stops.discard(None)
     for s in range(0, len(jobs), batch):
         chunk = jobs[s:s + batch]
         texts = [processor.apply_chat_template(user_messages(j[3]), tokenize=False, add_generation_prompt=True)
                  for j in chunk]
-        images = [load_image(j[1], j[2], opts["max_pixels"], bool(opts["upscale"]), listed(opts["enhance"], j[4]))
+        images = [load_image(j[1], j[2], opts["max_pixels"], bool(opts["upscale"]), listed(opts["enhance"], j[4]),
+                             rotate=j[5] if len(j) > 5 else 0)
                   for j in chunk]
         enc = processor(text=texts, images=images, padding=True, return_tensors="pt").to(model.device)
+        if sureness is not None:
+            watch = Sureness()
+            extra = {"logits_processor": LogitsProcessorList([watch])}
         out = model.generate(**enc, max_new_tokens=opts["max_new_tokens"], do_sample=False,
                              repetition_penalty=penalty or opts.get("repetition_penalty", 1.05),
-                             no_repeat_ngram_size=int(opts.get("no_repeat_ngram_size", 0) or 0), use_cache=True)
-        for j, text in zip(chunk, processor.batch_decode(out[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)):
+                             no_repeat_ngram_size=int(opts.get("no_repeat_ngram_size", 0) or 0), use_cache=True,
+                             **extra)
+        written = out[:, enc["input_ids"].shape[1]:]
+        for row, (j, text) in enumerate(zip(chunk, processor.batch_decode(written, skip_special_tokens=True))):
             out_texts[j[0]] = text.strip()
+            if sureness is not None:
+                tokens = written[row].tolist()
+                n = next((i + 1 for i, t in enumerate(tokens) if t in stops), len(tokens))   # up to its end mark
+                n = max(1, min(n, len(watch.steps)))
+                sureness[j[0]] = float(torch.stack(watch.steps[:n])[:, row].mean()) if watch.steps else 0.0
     processor.tokenizer.padding_side = "right"
     return out_texts
 
 
-def read_pages(model, processor, page_ids, parts, data_dir, doc_ctx, categories, opts, expected, batch):
+def read_pages(model, processor, page_ids, parts, data_dir, doc_ctx, categories, opts, expected, batch, notes=None):
     """{page_id: text} and the set of pages that needed a second reading.
 
     Each page is read whole or, for a survey spread, as two halves (left, then
     right). A part whose reading looks wrong (nothing, far too short, or stuck
     repeating) is read again as its top and bottom halves; the second reading
     is kept if it looks right. Then the text is cleaned up, and small Kade cards
-    get the postmark guess."""
+    get the postmark guess.
+
+    Collections named in --rotations: a short reading, or a page with little ink, is also read
+    turned by 90, 180 and 270 degrees, and the reading the model is surest of is kept.
+    Collections named in --ink_check: "far too short" is judged from the ink on the page, and
+    such a page is read in halves, and a half that is still too short in halves again.
+
+    notes, if given, is a dict that gets {page_id: {rotation, sureness, ink_chars, ...}} for the
+    page's first part, for the scores file."""
+    turn_set, ink_set = opts.get("rotations", ""), opts.get("ink_check", "")
     jobs, info = [], {}
     for pid in page_ids:
         cat = categories[pid]
-        prompt = build_prompt(cat, doc_ctx.get(pid.rsplit("_", 1)[0], ""))
+        turned, inky = listed(turn_set, cat), listed(ink_set, cat)
+        prompt = build_prompt(cat, doc_ctx.get(pid.rsplit("_", 1)[0], ""), sideways=turned)
         for order, r in enumerate(parts[parts.page_id == pid].to_dict("records")):
             box = parse_box(r["box"])
             key = (pid, order)
-            jobs.append((key, os.path.join(data_dir, r["image"]), box, prompt, cat))
-            info[key] = {"expected": expected.get(f"{cat}/{'half' if box else 'page'}", 0),
-                         "size": (int(r.get("width") or 0), int(r.get("height") or 0))}
-    texts = generate(model, processor, jobs, opts, batch)
-
+            path = os.path.join(data_dir, r["image"])
+            jobs.append((key, path, box, prompt, cat))
+            # With the ink check, the collection's usual length isn't used: a back with only an
+            # address is rightly short, and used to be read again in halves for it.
+            info[key] = {"expected": 0 if inky else expected.get(f"{cat}/{'half' if box else 'page'}", 0),
+                         "size": (int(r.get("width") or 0), int(r.get("height") or 0)),
+                         "turned": turned, "inky": inky, "rotation": 0,
+                         "ink": ink_chars(path, box) if (turned or inky) else 0.0}
+    sure = {} if any(i["turned"] for i in info.values()) else None
+    texts = generate(model, processor, jobs, opts, batch, sureness=sure)
     retried = set()
+
+    if sure is not None:
+        again = [((key, deg), path, box, prompt, cat, deg)
+                 for key, path, box, prompt, cat in jobs
+                 if info[key]["turned"] and info[key]["ink"] < DENSE_CHARS
+                 and (flat_len(texts[key]) < ROTATE_BELOW_CHARS or info[key]["ink"] < ROTATE_BELOW_INK)
+                 for deg in (90, 180, 270)]
+        if again:
+            other = generate(model, processor, again, opts, batch, sureness=sure)
+            margin = float(opts.get("rotation_margin", 0.1))
+            for key in sorted({j[0][0] for j in again}):
+                best, best_score = 0, (sure[key] if texts[key].strip() else float("-inf"))
+                for deg in (90, 180, 270):
+                    text = other[(key, deg)]
+                    if text.strip() and not looks_wrong(text, 0) and sure[(key, deg)] - margin > best_score:
+                        best, best_score = deg, sure[(key, deg)] - margin
+                info[key]["tried"] = {0: round(sure[key], 3), **{d: round(sure[(key, d)], 3) for d in (90, 180, 270)}}
+                if best:
+                    texts[key] = other[(key, best)]
+                    sure[key] = sure[(key, best)]
+                    info[key]["rotation"] = best
+                    retried.add(key[0])
+
     if opts["retry"]:
         again = []
         for key, path, box, prompt, cat in jobs:
-            if looks_wrong(texts[key], info[key]["expected"]):
+            if info[key]["rotation"] == 0 and looks_wrong(texts[key], info[key]["expected"]):
                 w, h = info[key]["size"]
                 for half, half_box in zip(("top", "bottom"), top_bottom(box, w, h)):
                     again.append(((key, half), path, half_box, prompt, cat))
@@ -283,6 +393,44 @@ def read_pages(model, processor, page_ids, parts, data_dir, doc_ctx, categories,
                 if not looks_wrong(joined, exp) or better:
                     texts[key] = joined
                     retried.add(key[0])
+
+    # Dense pages that stopped early (--ink_check): read in halves, and a half that is still far
+    # short of its ink in halves again. Each piece is then about as long as the pages the model
+    # reads well, and gets the whole pixel budget to itself.
+    job_of = {j[0]: j for j in jobs}
+    pieces = {key: [(job_of[key][2], texts[key])] for key in job_of
+              if info[key]["inky"] and info[key]["rotation"] == 0 and all(info[key]["size"])}
+    for depth in range(2):
+        again, short = [], []
+        for key, plist in pieces.items():
+            _, path, _, prompt, cat = job_of[key]
+            w, h = info[key]["size"]
+            for n, (box, text) in enumerate(plist):
+                ink = info[key]["ink"] if len(plist) == 1 else ink_chars(path, box)
+                if stopped_early(text, ink):
+                    halves = top_bottom(box, w, h, overlap=0.03)
+                    short.append((key, n, halves))
+                    again += [((key, depth, n, half), path, half_box, prompt, cat)
+                              for half, half_box in zip(("top", "bottom"), halves)]
+        if not again:
+            break
+        second = generate(model, processor, again, opts, batch)
+        split = False
+        for key, n, halves in sorted(short, key=lambda x: -x[1]):   # last piece first, so positions hold
+            top, bottom = second[(key, depth, n, "top")], second[(key, depth, n, "bottom")]
+            joined = join_halves(top, bottom)
+            if flat_len(joined) > 1.2 * flat_len(pieces[key][n][1]) and not looks_wrong(joined, 0):
+                pieces[key][n:n + 1] = [(halves[0], top), (halves[1], bottom)]
+                retried.add(key[0])
+                split = True
+        if not split:
+            break
+    for key, plist in pieces.items():
+        if len(plist) > 1:
+            text = plist[0][1]
+            for _, more in plist[1:]:
+                text = join_halves(text, more)
+            texts[key] = text
 
     if opts.get("compare_adapter"):
         # A second reading with another adapter (e.g. another epoch). Two adapters rarely run away
@@ -307,6 +455,11 @@ def read_pages(model, processor, page_ids, parts, data_dir, doc_ctx, categories,
             w, h = info[keys[0]]["size"]
             text = add_postmark_guess(text, categories[pid], w, h)
         result[pid] = text
+        if notes is not None and keys:
+            first = info[keys[0]]
+            notes[pid] = {"rotation": first["rotation"], "ink_chars": round(first["ink"]),
+                          "sureness": round(sure[keys[0]], 3) if sure is not None and keys[0] in sure else "",
+                          "rotations_tried": json.dumps(first["tried"]) if "tried" in first else ""}
     return result, retried
 
 
@@ -319,8 +472,9 @@ def score_dev(model, processor, dev, parts, args, opts, doc_ctx, expected, metri
     was_training = model.training
     model.eval()
     start = time.time()
+    notes = {}
     preds, retried = read_pages(model, processor, list(dev.page_id), parts, args.data_dir, doc_ctx,
-                                dict(zip(dev.page_id, dev.category)), opts, expected, args.eval_batch)
+                                dict(zip(dev.page_id, dev.category)), opts, expected, args.eval_batch, notes)
     rows = []
     for r in dev.to_dict("records"):
         pred, ref = preds[r["page_id"]], r["text"]
@@ -330,12 +484,16 @@ def score_dev(model, processor, dev, parts, args, opts, doc_ctx, expected, metri
                      "cer": page_cer(pred, ref), "cer_no_postmark": page_cer(without_postmark(pred), without_postmark(ref)),
                      "length_ratio": round(ratio, 2),
                      "problem": "too short" if ratio < 0.7 else "too long" if ratio > 1.1 else "",
-                     "read_twice": r["page_id"] in retried, "prediction": pred, "reference": ref})
+                     "read_twice": r["page_id"] in retried, **notes.get(r["page_id"], {}),
+                     "prediction": pred, "reference": ref})
     df = pd.DataFrame(rows)
     by_cat = df.groupby("category")["cer"].mean()
     print(f"[dev {label}] {len(df)} pages in {(time.time() - start) / 60:.1f} min: "
           + ", ".join(f"{c} {v:.3f}" for c, v in by_cat.items()) + f"; mean of collections {by_cat.mean():.3f}"
           + (f"; {len(retried)} read twice" if retried else ""), flush=True)
+    if "rotation" in df.columns and (df.rotation != 0).any():
+        print("    kept a turned reading: " + ", ".join(f"{r.page_id} ({int(r.rotation)} degrees)"
+                                                        for r in df[df.rotation != 0].itertuples()), flush=True)
     if (df.category == "kade_letters").any():
         kade = df[df.category == "kade_letters"]
         print(f"    kade_letters without postmarks {kade.cer_no_postmark.mean():.3f}; by document: "
@@ -360,10 +518,10 @@ def oversampled(items, setting):
 
 
 class PageDataset(Dataset):
-    def __init__(self, items, data_dir, doc_ctx, opts, augment_setting, seed):
+    def __init__(self, items, data_dir, doc_ctx, opts, augment_setting, seed, rotate_setting=""):
         self.rows = items.to_dict("records")
         self.data_dir, self.doc_ctx, self.opts = data_dir, doc_ctx, opts
-        self.augment_setting = augment_setting
+        self.augment_setting, self.rotate_setting = augment_setting, rotate_setting
         self.rng = random.Random(seed)
 
     def __len__(self):
@@ -372,11 +530,16 @@ class PageDataset(Dataset):
     def __getitem__(self, i):
         r = self.rows[i]
         cat = r["category"]
+        # Half the time, a page of these collections is turned on its side or upside down, with
+        # the same label: the model has to read the writing whichever way up it is, which the
+        # backs of folded letters need, and can't lean on where a remembered page's lines were.
+        turn = self.rng.choice((90, 180, 270)) if listed(self.rotate_setting, cat) and self.rng.random() < 0.5 else 0
         img = load_image(os.path.join(self.data_dir, r["image"]), parse_box(r["box"]), self.opts["max_pixels"],
-                         bool(self.opts["upscale"]), listed(self.opts["enhance"], cat))
+                         bool(self.opts["upscale"]), listed(self.opts["enhance"], cat), rotate=turn)
         if listed(self.augment_setting, cat):
             img = augment(img, self.rng, cat)
-        prompt = build_prompt(cat, self.doc_ctx.get(r["doc_id"], ""))
+        prompt = build_prompt(cat, self.doc_ctx.get(r["doc_id"], ""),
+                              sideways=listed(self.opts.get("rotations", ""), cat))
         return {"image": img, "prompt": prompt, "answer": r["text"]}
 
 
@@ -410,6 +573,24 @@ class Collator:
         return enc
 
 
+def as_training_items(pages, parts):
+    """Rows like train_items.csv for labelled pages that prepare_data.py left out of it (the dev
+    pages): a survey spread whose label splits becomes two images, as there."""
+    rows = []
+    for r in pages.to_dict("records"):
+        prs = parts[parts.page_id == r["page_id"]].to_dict("records")
+        if not prs:
+            continue
+        text = training_text(r["text"], r["category"])
+        halves = split_survey_label(text) if len(prs) == 2 else None
+        base = {"page_id": r["page_id"], "doc_id": r["doc_id"], "category": r["category"]}
+        if halves:
+            rows += [{**base, "image": p["image"], "box": p["box"], "text": h} for p, h in zip(prs, halves)]
+        else:
+            rows.append({**base, "image": prs[0]["image"], "box": "", "text": text})
+    return pd.DataFrame(rows, columns=["page_id", "doc_id", "category", "image", "box", "text"])
+
+
 def per_category(df, pick):
     """Apply `pick` to each collection's rows and put them back together."""
     return pd.concat([pick(df[df.category == c]) for c in sorted(df.category.unique())]) if len(df) else df
@@ -429,7 +610,8 @@ def main():
     parts = pd.read_csv(os.path.join(args.data_dir, "parts.csv"), keep_default_na=False)
     expected_path = os.path.join(args.data_dir, "expected_chars.json")
     expected = json.load(open(expected_path)) if os.path.exists(expected_path) else {}
-    doc_ctx = load_metadata(os.path.join(args.data_dir, "metadata.csv")) if args.use_metadata else {}
+    doc_ctx = load_metadata(os.path.join(args.data_dir, "metadata.csv"), args.rich_context) \
+        if args.use_metadata else {}
     train_pages = None
     if args.holdout_docs or args.train_score_pages:
         train_pages = pd.read_csv(os.path.join(args.data_dir, "train.csv"), keep_default_na=False, encoding="utf-8-sig")
@@ -448,6 +630,15 @@ def main():
             raise SystemExit(f"No such document in train.csv: {', '.join(sorted(unknown))}")
         items = items[~items.doc_id.isin(held)]
         held_pages = train_pages[train_pages.doc_id.isin(held)]
+        # The usual dev pages of those collections aren't scored now, so the ones outside the
+        # held-out documents are trained on. (Every Kade dev page is in kade_112, which each Kade
+        # split holds out, so this changes nothing there; it matters for Dominy, where the
+        # held-out documents are chosen to look like the test pages.)
+        freed = dev[dev.category.isin(set(held_pages.category)) & ~dev.doc_id.isin(held)]
+        if len(freed):
+            items = pd.concat([items, as_training_items(freed, parts)], ignore_index=True)
+            print(f"training on {len(freed)} of the usual dev pages, since other documents are held out: "
+                  + ", ".join(freed.page_id), flush=True)
         dev = pd.concat([dev[~dev.category.isin(set(held_pages.category))],
                          held_pages[["page_id", "doc_id", "category", "label_source", "text"]]], ignore_index=True)
         print(f"held out: {', '.join(f'{d} ({n} pages)' for d, n in held_pages.doc_id.value_counts().sort_index().items())}",
@@ -460,19 +651,8 @@ def main():
     if args.train_on_dev:
         if args.holdout_docs:
             raise SystemExit("--train_on_dev and --holdout_docs don't go together: the held-out pages are the dev pages.")
-        extra = []
-        for r in dev.to_dict("records"):
-            prs = parts[parts.page_id == r["page_id"]].to_dict("records")
-            if not prs:
-                continue
-            text = training_text(r["text"], r["category"])
-            halves = split_survey_label(text) if len(prs) == 2 else None   # a survey spread, as in prepare_data.py
-            base = {"page_id": r["page_id"], "doc_id": r["doc_id"], "category": r["category"]}
-            if halves:
-                extra += [{**base, "image": p["image"], "box": p["box"], "text": h} for p, h in zip(prs, halves)]
-            else:
-                extra.append({**base, "image": prs[0]["image"], "box": "", "text": text})
-        items = pd.concat([items, pd.DataFrame(extra)], ignore_index=True)
+        extra = as_training_items(dev, parts)
+        items = pd.concat([items, extra], ignore_index=True)
         print(f"also training on the {len(dev)} dev pages ({len(extra)} images)", flush=True)
     trained_on = sorted(set(items.page_id))
     if args.max_train_items:
@@ -507,7 +687,8 @@ def main():
     model, processor, dtype = load_model(args.model_id, args.max_pixels, args.adapter_dir or None,
                                          args.compare_adapter or None)
     summary = {"model_id": args.model_id, "epochs": args.epochs, "lr": args.lr, "lora_r": args.lora_r,
-               "lora_alpha": args.lora_alpha, "train_vision": args.train_vision, "augment": args.augment,
+               "lora_alpha": args.lora_alpha, "lora_dropout": args.lora_dropout,
+               "train_vision": args.train_vision, "augment": args.augment, "rotate_train": args.rotate_train,
                "oversample": args.oversample, "effective_batch": args.batch_size * args.grad_accum,
                "train_images_per_epoch": len(items), "dev_pages": len(dev),
                "categories": args.categories, "holdout_docs": args.holdout_docs,
@@ -575,7 +756,8 @@ def main():
             remove_unused_columns=False, dataloader_num_workers=2, seed=args.seed,
             use_cpu=not torch.cuda.is_available())
         trainer = Trainer(model=model, args=targs,
-                          train_dataset=PageDataset(items, args.data_dir, doc_ctx, opts, args.augment, args.seed),
+                          train_dataset=PageDataset(items, args.data_dir, doc_ctx, opts, args.augment, args.seed,
+                                                    args.rotate_train),
                           data_collator=Collator(processor), callbacks=[Watch()])
         start = time.time()
         result = trainer.train(resume_from_checkpoint=last)

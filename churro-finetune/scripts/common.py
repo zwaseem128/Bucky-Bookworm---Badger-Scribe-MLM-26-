@@ -55,25 +55,47 @@ def category_of(page_id: str) -> str:
     return CATEGORY.get(page_id.split("_")[0], "")
 
 
-def build_prompt(category: str, doc_context: str = "") -> str:
+# For collections read with --rotations. A third of the Dominy test pages are the backs of
+# folded letters and bills: an address panel, a postmark or a docket, often written sideways or
+# upside down, on a sheet that is otherwise blank apart from ink showing through.
+SIDEWAYS_HINT = ("If this is the back of a folded letter or bill, it may hold only an address, a postmark "
+                 "or a short docket, written sideways or upside down. Write just those words, and nothing "
+                 "that is not on the page.")
+
+
+def build_prompt(category: str, doc_context: str = "", sideways: bool = False) -> str:
     lang = "German (Kurrent script)" if category == "kade_letters" else "English"
-    parts = [INSTRUCTION, f"Language: {lang}.", HINTS.get(category, "")]
+    parts = [INSTRUCTION, f"Language: {lang}.", HINTS.get(category, ""), SIDEWAYS_HINT if sideways else ""]
     if doc_context:
         parts.append(f"Catalog record: {doc_context}")
     return "\n".join(p for p in parts if p)
 
 
-def load_metadata(path) -> dict:
-    """metadata.csv -> {doc_id: one-line catalog context}, if the file has the columns."""
+def load_metadata(path, rich: str = "") -> dict:
+    """metadata.csv -> {doc_id: one-line catalog context}, if the file has the columns.
+
+    rich names collections ("dominy_accounts", "all", ...) that also get the record's creator and
+    summary. A Dominy summary names the people on the page ("Order from Calvin Moore, Sag Harbor, to
+    Capt. Felix Dominy"), and names are what the short address panels consist of. The competition
+    allows this: the catalog may settle a doubtful reading, the page still decides what is written.
+    """
     try:
-        md = pd.read_csv(path, keep_default_na=False)
+        md = pd.read_csv(path, keep_default_na=False, encoding="utf-8-sig")
     except (FileNotFoundError, pd.errors.EmptyDataError):
         return {}
     if "doc_id" not in md.columns:
         return {}
+    wanted = {s.strip() for s in str(rich).split(",") if s.strip()}
     ctx = {}
     for r in md.to_dict("records"):
-        bits = [str(r.get(k, "")) for k in ("title", "date", "language") if r.get(k, "")]
+        if "all" in wanted or category_of(str(r["doc_id"])) in wanted:
+            bits = []
+            for k in ("title", "creator", "date", "language", "summary"):
+                v = " ".join(str(r.get(k, "")).split())[:300]
+                if v and v not in bits:
+                    bits.append(v)
+        else:   # exactly as the earlier runs were trained
+            bits = [str(r.get(k, "")) for k in ("title", "date", "language") if r.get(k, "")]
         prefix = f"{r.get('collection', '')}: " if r.get("collection", "") else ""
         if bits:
             ctx[r["doc_id"]] = prefix + "; ".join(bits)
@@ -187,9 +209,15 @@ def clean_output(text: str, category: str = "", max_chars: int = 3000) -> str:
 # ---------------------------------------------------------------------------
 # Images
 # ---------------------------------------------------------------------------
+_TURN = {90: Image.ROTATE_90, 180: Image.ROTATE_180, 270: Image.ROTATE_270}
+
+
 def load_image(path, box=None, max_pixels: int = MAX_PIXELS, upscale: bool = True,
-               enhance: bool = False) -> Image.Image:
+               enhance: bool = False, rotate: int = 0) -> Image.Image:
     """Open a page (or one part of it), ready for the model.
+
+    rotate: turn the image by 90, 180 or 270 degrees (counter-clockwise), for writing that
+    runs sideways or upside down.
 
     upscale (audit problem 2, Kade): the dev postcards are 693 x 1151 pixels,
     half the size of most Kade scans, in faint pencil. A small image is
@@ -205,6 +233,8 @@ def load_image(path, box=None, max_pixels: int = MAX_PIXELS, upscale: bool = Tru
     img = img.convert("RGB")
     if box is not None:
         img = img.crop(tuple(box))
+    if rotate in _TURN:
+        img = img.transpose(_TURN[rotate])
     if upscale and img.width * img.height < 0.8 * max_pixels:
         f = (max_pixels / (img.width * img.height)) ** 0.5
         img = img.resize((int(img.width * f), int(img.height * f)), Image.LANCZOS)
@@ -287,6 +317,62 @@ def top_bottom(box, width, height, overlap=0.06):
     l, t, r, b = box if box else (0, 0, width, height)
     mid, pad = (t + b) // 2, int(overlap * (b - t))
     return (l, t, r, mid + pad), (l, mid - pad, r, b)
+
+
+# ---------------------------------------------------------------------------
+# How much writing is on the page (Dominy)
+# ---------------------------------------------------------------------------
+# The usual length of a collection's pages says little about one Dominy page: the labels run
+# from 27 characters (an address on the back of a bill) to 2,000 (a ledger page). The amount of
+# ink does: over the 36 labelled Dominy pages, the count of dark-stroke pixels and the label's
+# length correlate at 0.95. Full pages have about 215 such pixels per character (166 to 289).
+# Backs with only an address have far more per character (large writing, postmarks, show-through),
+# so for them this is an upper limit, not an estimate.
+INK_PER_CHAR = 215
+# A page is "dense" from this many estimated characters. Every labelled page above it is a full
+# page of writing (633 characters or more), and none has under 0.74 of its estimate, so a reading
+# under half the estimate has stopped early.
+DENSE_CHARS = 700
+STOPPED_EARLY = 0.5
+
+
+def ink_chars(path, box=None) -> float:
+    """About how many characters are written on a page (or one part of it), from its ink.
+
+    A pixel counts as ink when it is clearly darker than its surroundings and lies on paper, not
+    on the black scanner bed around the sheet. Faint show-through from the other side mostly
+    falls under the threshold."""
+    import numpy as np
+    img = Image.open(path).convert("L")
+    if box is not None:
+        img = img.crop(tuple(box))
+    small = img.resize((max(1, img.width // 2), max(1, img.height // 2)), Image.BILINEAR)
+    grey = np.asarray(small, dtype=np.int16)
+    around = np.asarray(small.filter(ImageFilter.GaussianBlur(10)), dtype=np.int16)
+    paper = np.asarray(small.filter(ImageFilter.GaussianBlur(20)), dtype=np.int16) > 115
+    ink = ((around - grey) > 30) & paper
+    return float(ink.sum()) * 4 / INK_PER_CHAR
+
+
+def stopped_early(text: str, ink_estimate: float) -> bool:
+    """True when a dense page's reading is under half of what its ink says is there."""
+    return ink_estimate >= DENSE_CHARS and len(" ".join(text.split())) < STOPPED_EARLY * ink_estimate
+
+
+def join_halves(top: str, bottom: str, window: int = 5) -> str:
+    """Top and bottom readings as one text. The two halves overlap a little, so the rows in the
+    overlap are read twice: the bottom's first lines are dropped up to the last one that repeats
+    one of the top's last lines."""
+    import difflib
+    a = [l for l in top.split("\n") if l.strip()]
+    b = [l for l in bottom.split("\n") if l.strip()]
+    tail = [" ".join(l.split()) for l in a[-window:]]
+    drop = 0
+    for i, line in enumerate(b[:window]):
+        line = " ".join(line.split())
+        if len(line) >= 8 and any(difflib.SequenceMatcher(None, line, t).ratio() >= 0.85 for t in tail):
+            drop = i + 1
+    return "\n".join(a + b[drop:])
 
 
 # ---------------------------------------------------------------------------

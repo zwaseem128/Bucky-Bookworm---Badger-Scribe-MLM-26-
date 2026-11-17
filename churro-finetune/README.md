@@ -23,6 +23,8 @@ The numbers are the audit's own problem numbers.
 | **5. Dominy: stains, bleed-through, and `#` in the labels.** | `#` (what the transcriber couldn't read) is never something the model learns to write. Training images sometimes get a faint mirror image of the page on top, like ink from the back showing through. An optional contrast stretch for faded pages. | always; `augment`; `enhance` |
 | **6. Dominy: ledger symbols the labels leave out.** | No training label contains a check mark or `×`, so they're removed from the output; curly quotes and long dashes become plain ones; fractions are written ½ ¼ ¾ as the labels do. | always |
 | **7. Few pages, short pages.** Each collection is a third of the score, but Dominy has only 27 training pages. | Dominy's training images are used 4 times per epoch, each time with different random changes. | `oversample` |
+| **10. Dominy: backs written sideways or upside down.** 15 of the 36 Dominy test pages are backs of folded sheets: an address, postmark or docket of 30–110 characters. | A short reading is redone turned by 90, 180 and 270 degrees and the reading the model is surest of is kept; half the training images are turned; the catalog's creator and summary (which name the people) join the prompt. | `rotations`, `rotate_train`, `rich_context` |
+| **11. Dominy: dense ledgers that stop after a few rows.** | The amount of ink on the page says how much text to expect (it tracks the label's length at r = 0.95 on the 36 labelled pages). A reading under half of that is redone in halves, and a half in halves again. | `ink_check` |
 | **8. Survey: vocabulary and numbers.** | Learned from the 365 survey training images (pages and half-spreads). | training |
 | **9. Machine-drafted labels.** 42 of 44 English dev labels are drafts, about 6–8% wrong themselves. | The scores on the expert-typed dev pages are shown separately. | scoring |
 
@@ -210,8 +212,14 @@ scores in the team's results table.
 | `cut_repeats` | `""` | Cuts a reading where it starts repeating a 22-character stretch it already wrote, for the named collections. Untrained CHURRO often reads a letter correctly, then keeps inventing text. On the 88 held-out Kade pages this took the untrained score from 0.327 to 0.266; it cost two pages about 0.2 each. | Try `"kade_letters"` with `"rescore"` on a trained adapter. Don't use it on survey notes without testing: their tables repeat on purpose. |
 | `retry_pick` | `"longer"` | When both readings of a part look wrong, which to keep. `"longer"` was the original rule, but a reading stuck repeating is the long one; `"closer"` keeps the one whose length is closer to the usual length. | Try `"closer"` with `"rescore"`. |
 
+| `rotations` | `""` | For the named collections, a reading under 250 characters (or a page with little ink) is also read turned by 90, 180 and 270 degrees; a turned reading replaces the upright one when the model is surer of it by `rotation_margin` (0.1, mean log-probability per token). The Dominy runs set it. | Step 6 lists the pages kept turned; `dev_scores.csv` has every rotation's sureness. |
+| `ink_check` | `""` | For the named collections, "stopped early" is judged from the ink on the page instead of the collection's usual length, and such a page is read in halves. Also stops short backs being re-read in halves just for being short. The Dominy runs set it. | |
+| `rich_context` | `""` | For the named collections, the prompt's catalog record also has the creator and the summary. The Dominy runs set it. | |
+| `rotate_train` | `""` | Turns the named collections' training images by 90, 180 or 270 degrees half the time, with the same label. The Dominy runs set it. | |
+| `lora_dropout` | 0.05 | Silences part of the adapter at random while training, so it memorises less. The Dominy runs use 0.1. | |
+
 The reading settings (`max_pixels`, `max_new_tokens`, `upscale`, `enhance`, `retry`, `postmark_guess`,
-`repetition_penalty`, `cut_repeats`, `retry_pick`) are saved with each run, and Notebook 3 reads the test pages with exactly
+`repetition_penalty`, `cut_repeats`, `retry_pick`, `rotations`, `ink_check`, `rich_context`) are saved with each run, and Notebook 3 reads the test pages with exactly
 the chosen run's settings.
 
 ### Kade runs: held-out documents
@@ -223,6 +231,26 @@ and score them. They report each document, the score without the postmark line, 
 10 training pages. A `"kade"` run trains on Kade only for 5 epochs, scores every held-out page
 after each epoch, and keeps each epoch's adapter in `epoch1/` to `epoch5/`. Choose settings on
 split A, confirm on split B, and use the page-by-page comparison in Step 6 rather than the mean.
+
+### Dominy runs: backs, ledgers, and a dev set that looks like the test set
+
+The Dominy test pages are 19 fronts (`p002`), 15 backs (`p003`) and two later pages, from 19
+documents, none of them in the training data. The usual 9 Dominy dev pages don't look like that:
+4 are one dense ledger and only 2 are backs. So:
+
+- **`"dominy-check"`** trains nothing and reads all 36 labelled Dominy pages with the Dominy
+  reading fixes, by plain CHURRO or by `ADAPTER`. It shows what the reading fixes alone are worth.
+- **`"dominy"`** holds out six documents that each have a front and a back (`DOMINY_HOLDOUT`) and
+  trains on the other 24 pages, the dense ledger included: 4 epochs at lr 1e-4, each image used 4
+  times per epoch and turned half the time. It scores the 12 held-out pages before training and
+  after every epoch, and keeps each epoch's adapter. Earlier Dominy runs (lr 2e-4, no turning)
+  were best after one epoch and then memorised their pages, writing a remembered docket on any
+  back they couldn't read.
+- **`"dominy-final"`** trains on all 36 pages for `FINAL_EPOCHS`: set it to the best epoch of the
+  `"dominy"` run. This is the adapter for the test pages.
+
+Don't set `cut_repeats` for Dominy. Ledger rows repeat ("to repair ditch wheel 0 1 0"), and the
+rule would cut 6 of the 36 labels short.
 
 ### Survey runs, rescoring, and the final models
 
