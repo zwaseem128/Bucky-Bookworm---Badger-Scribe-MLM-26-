@@ -8,7 +8,7 @@ Pages are read exactly the way that run's dev pages were scored: its adapter
 (if it has one; the baseline run doesn't), its reading settings from
 summary.json (image size, enlarging small images, contrast, the second
 reading of a part that looks wrong, the postmark guess, and for Dominy the
-turned readings, the ink check and the fuller catalog record), survey spreads in
+turned readings, the ink check and the catalog record), survey spreads in
 two halves, the same prompt and the same clean-up. Pages already in --out are
 skipped, so an interrupted run carries on where it stopped.
 """
@@ -23,7 +23,7 @@ import time
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import category_of, load_metadata  # noqa: E402
+from common import catalog_context, category_of  # noqa: E402
 from finetune_churro import load_model, read_pages  # noqa: E402
 
 
@@ -59,7 +59,7 @@ def main():
     parts = pd.read_csv(os.path.join(args.data_dir, "parts.csv"), keep_default_na=False)
     expected_path = os.path.join(args.data_dir, "expected_chars.json")
     expected = json.load(open(expected_path)) if os.path.exists(expected_path) else {}
-    doc_ctx = load_metadata(os.path.join(args.data_dir, "metadata.csv"), opts.get("rich_context", ""))
+    doc_ctx = catalog_context(args.data_dir, opts.get("rich_context", ""))
     model, processor, _ = load_model(args.model_id or summary["model_id"], opts["max_pixels"],
                                      adapter, opts.get("compare_adapter") or None)
     new = not os.path.exists(args.out)

@@ -27,7 +27,7 @@ audit problem (docs/dev-set-error-audit.md on lokesh/data-dev-set):
     upside down on an otherwise blank sheet. Short readings are redone at the other three
     rotations and the reading the model is surest of is kept (--rotations); training
     images are turned at random so the model learns to read them (--rotate_train); the
-    catalog's creator and summary, which name the people, join the prompt (--rich_context).
+    catalog record, which names the people, joins the prompt (--rich_context).
 11. Dense Dominy ledgers that stop early: the amount of ink on the page says how much
     text to expect, and a reading far below it is redone in halves, twice if need be
     (--ink_check).
@@ -65,13 +65,13 @@ from common import (  # noqa: E402
     add_postmark_guess,
     augment,
     build_prompt,
+    catalog_context,
     clean_output,
     cut_at_repeat,
     full_messages,
     ink_chars,
     join_halves,
     load_image,
-    load_metadata,
     looks_wrong,
     split_survey_label,
     stopped_early,
@@ -166,7 +166,8 @@ def parse_args():
                    help="collections where 'stopped early' is judged from the ink on the page instead of the "
                         "collection's usual length, and such pages are redone in halves, e.g. dominy_accounts")
     p.add_argument("--rich_context", default="",
-                   help="collections whose prompt also gets the catalog's creator and summary, e.g. dominy_accounts")
+                   help="collections whose prompt gets the catalog record from <data_dir>/metadata.csv (title, "
+                        "creator, date, summary), e.g. dominy_accounts. No other collection gets one.")
     p.add_argument("--init_adapter", default="",
                    help="start training from this saved adapter (e.g. a run's epoch3) instead of a new one, "
                         "with a fresh learning-rate schedule")
@@ -610,8 +611,7 @@ def main():
     parts = pd.read_csv(os.path.join(args.data_dir, "parts.csv"), keep_default_na=False)
     expected_path = os.path.join(args.data_dir, "expected_chars.json")
     expected = json.load(open(expected_path)) if os.path.exists(expected_path) else {}
-    doc_ctx = load_metadata(os.path.join(args.data_dir, "metadata.csv"), args.rich_context) \
-        if args.use_metadata else {}
+    doc_ctx = catalog_context(args.data_dir, args.rich_context) if args.use_metadata else {}
     train_pages = None
     if args.holdout_docs or args.train_score_pages:
         train_pages = pd.read_csv(os.path.join(args.data_dir, "train.csv"), keep_default_na=False, encoding="utf-8-sig")

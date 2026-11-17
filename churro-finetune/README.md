@@ -23,7 +23,7 @@ The numbers are the audit's own problem numbers.
 | **5. Dominy: stains, bleed-through, and `#` in the labels.** | `#` (what the transcriber couldn't read) is never something the model learns to write. Training images sometimes get a faint mirror image of the page on top, like ink from the back showing through. An optional contrast stretch for faded pages. | always; `augment`; `enhance` |
 | **6. Dominy: ledger symbols the labels leave out.** | No training label contains a check mark or `×`, so they're removed from the output; curly quotes and long dashes become plain ones; fractions are written ½ ¼ ¾ as the labels do. | always |
 | **7. Few pages, short pages.** Each collection is a third of the score, but Dominy has only 27 training pages. | Dominy's training images are used 4 times per epoch, each time with different random changes. | `oversample` |
-| **10. Dominy: backs written sideways or upside down.** 15 of the 36 Dominy test pages are backs of folded sheets: an address, postmark or docket of 30–110 characters. | A short reading is redone turned by 90, 180 and 270 degrees and the reading the model is surest of is kept; half the training images are turned; the catalog's creator and summary (which name the people) join the prompt. | `rotations`, `rotate_train`, `rich_context` |
+| **10. Dominy: backs written sideways or upside down.** 15 of the 36 Dominy test pages are backs of folded sheets: an address, postmark or docket of 30–110 characters. | A short reading is redone turned by 90, 180 and 270 degrees and the reading the model is surest of is kept; half the training images are turned; the catalog record (which names the people) joins the prompt. | `rotations`, `rotate_train`, `rich_context` |
 | **11. Dominy: dense ledgers that stop after a few rows.** | The amount of ink on the page says how much text to expect (it tracks the label's length at r = 0.95 on the 36 labelled pages). A reading under half of that is redone in halves, and a half in halves again. | `ink_check` |
 | **8. Survey: vocabulary and numbers.** | Learned from the 365 survey training images (pages and half-spreads). | training |
 | **9. Machine-drafted labels.** 42 of 44 English dev labels are drafts, about 6–8% wrong themselves. | The scores on the expert-typed dev pages are shown separately. | scoring |
@@ -139,8 +139,15 @@ Notebook 1 needs the **full competition data** in S3, in one folder:
 <folder>/train.csv
 <folder>/test.csv
 <folder>/images/kade_007_p005.jpg, survey_002_p0010.jpg, dominy_001_p002.jpg, ...
-(optional) <folder>/metadata.csv, <folder>/sample_submission.csv
+(optional) <folder>/sample_submission.csv
 ```
+
+The Dominy runs also need the competition's **`metadata.csv`** (the catalog record of every
+document) in `churro-work/data` on the notebook instance. It was not part of the first upload, so
+put it there once: in JupyterLab's file browser open `churro-work/data` and upload `metadata.csv`
+from the Kaggle download. A run that needs it and doesn't find it stops and says so. Only the
+collections named in `rich_context` get a catalog record in their prompt, so the file's presence
+changes nothing for Kade and the survey notes.
 
 The class bucket `ml-marathon-shared` has only the Kade letters, so upload the Kaggle download to
 your own bucket: get it from the competition's **Data** tab (Download All) and unzip it; in the
@@ -214,7 +221,7 @@ scores in the team's results table.
 
 | `rotations` | `""` | For the named collections, a reading under 250 characters (or a page with little ink) is also read turned by 90, 180 and 270 degrees; a turned reading replaces the upright one when the model is surer of it by `rotation_margin` (0.1, mean log-probability per token). The Dominy runs set it. | Step 6 lists the pages kept turned; `dev_scores.csv` has every rotation's sureness. |
 | `ink_check` | `""` | For the named collections, "stopped early" is judged from the ink on the page instead of the collection's usual length, and such a page is read in halves. Also stops short backs being re-read in halves just for being short. The Dominy runs set it. | |
-| `rich_context` | `""` | For the named collections, the prompt's catalog record also has the creator and the summary. The Dominy runs set it. | |
+| `rich_context` | `""` | The named collections get the document's catalog record in the prompt (title, creator, date, summary), from `churro-work/data/metadata.csv`. No other collection gets one: no earlier run had the file, so Kade and survey stay as they were trained. The Dominy runs set it. | |
 | `rotate_train` | `""` | Turns the named collections' training images by 90, 180 or 270 degrees half the time, with the same label. The Dominy runs set it. | |
 | `lora_dropout` | 0.05 | Silences part of the adapter at random while training, so it memorises less. The Dominy runs use 0.1. | |
 

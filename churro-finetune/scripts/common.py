@@ -11,6 +11,7 @@ additions aimed at the problems in Lokesh's dev-set audit
 names the problem it is for.
 """
 
+import os
 import re
 import statistics
 
@@ -71,34 +72,57 @@ def build_prompt(category: str, doc_context: str = "", sideways: bool = False) -
     return "\n".join(p for p in parts if p)
 
 
-def load_metadata(path, rich: str = "") -> dict:
-    """metadata.csv -> {doc_id: one-line catalog context}, if the file has the columns.
+def load_metadata(path, collections: str = "") -> dict:
+    """metadata.csv -> {doc_id: one-line catalog record}, for the collections named
+    ("dominy_accounts", a comma-separated list, or "all"). No collection named, or no file: {}.
 
-    rich names collections ("dominy_accounts", "all", ...) that also get the record's creator and
-    summary. A Dominy summary names the people on the page ("Order from Calvin Moore, Sag Harbor, to
-    Capt. Felix Dominy"), and names are what the short address panels consist of. The competition
-    allows this: the catalog may settle a doubtful reading, the page still decides what is written.
+    The record is the title, creator, date, language and summary. A Dominy summary names the
+    people on the page ("Order from Calvin Moore, Sag Harbor, to Capt. Felix Dominy"), and names
+    are what the short address panels consist of. The competition allows this: the catalog may
+    settle a doubtful reading, the page still decides what is written.
+
+    A collection gets the record only when it is named. Until November 2026 metadata.csv was
+    never in the data folder the runs used, so no earlier run saw a catalog record; adding the
+    file must not change how the Kade and survey adapters, trained without it, are prompted.
     """
+    wanted = {s.strip() for s in str(collections).split(",") if s.strip()}
+    if not wanted:
+        return {}
     try:
         md = pd.read_csv(path, keep_default_na=False, encoding="utf-8-sig")
     except (FileNotFoundError, pd.errors.EmptyDataError):
         return {}
     if "doc_id" not in md.columns:
         return {}
-    wanted = {s.strip() for s in str(rich).split(",") if s.strip()}
     ctx = {}
     for r in md.to_dict("records"):
-        if "all" in wanted or category_of(str(r["doc_id"])) in wanted:
-            bits = []
-            for k in ("title", "creator", "date", "language", "summary"):
-                v = " ".join(str(r.get(k, "")).split())[:300]
-                if v and v not in bits:
-                    bits.append(v)
-        else:   # exactly as the earlier runs were trained
-            bits = [str(r.get(k, "")) for k in ("title", "date", "language") if r.get(k, "")]
+        if "all" not in wanted and category_of(str(r["doc_id"])) not in wanted:
+            continue
+        bits = []
+        for k in ("title", "creator", "date", "language", "summary"):
+            v = " ".join(str(r.get(k, "")).split())[:300]
+            if v and v not in bits:
+                bits.append(v)
         prefix = f"{r.get('collection', '')}: " if r.get("collection", "") else ""
         if bits:
             ctx[r["doc_id"]] = prefix + "; ".join(bits)
+    return ctx
+
+
+def catalog_context(data_dir, collections: str = "") -> dict:
+    """load_metadata for a run's --rich_context collections. Stops, saying what to do, when
+    collections are named but <data_dir>/metadata.csv isn't there: reading without the record a
+    model was trained with would quietly score worse."""
+    if not str(collections).strip():
+        return {}
+    path = os.path.join(data_dir, "metadata.csv")
+    ctx = load_metadata(path, collections)
+    if not ctx:
+        raise SystemExit(
+            f"rich_context = {collections!r} needs the competition's metadata.csv, and {path} "
+            "is missing (or has no rows for those collections). It comes with the Kaggle download "
+            "(Data tab, Download All). In JupyterLab's file browser, open churro-work/data and "
+            "upload metadata.csv there, then run this again.")
     return ctx
 
 
