@@ -11,6 +11,7 @@ as on the notebook instance. Everything the script prints is also appended to a 
 output folder (like `tee -a` in the notebook), so it reaches S3 while the job runs.
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -30,8 +31,16 @@ def main():
 
     here = os.path.dirname(os.path.abspath(__file__))
     script = os.path.join(here, os.environ["CHURRO_SCRIPT"])
+    # The script's arguments come from job_args.json, written by sagemaker_job.py. The ones the
+    # container puts on this command line are incomplete: it drops empty values (--enhance "").
+    args_file = os.path.join(here, "job_args.json")
+    if os.path.exists(args_file):
+        args = [part for key, value in json.load(open(args_file, encoding="utf-8")).items()
+                for part in (f"--{key}", str(value))]
+    else:
+        args = sys.argv[1:]
     with open(os.path.join(out, os.environ.get("CHURRO_LOG", "job.log")), "a", encoding="utf-8") as log:
-        proc = subprocess.Popen([sys.executable, "-u", script, *sys.argv[1:]], stdout=subprocess.PIPE,
+        proc = subprocess.Popen([sys.executable, "-u", script, *args], stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, bufsize=1, errors="replace")
         for line in proc.stdout:
             sys.stdout.write(line)

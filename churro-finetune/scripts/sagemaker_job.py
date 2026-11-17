@@ -95,8 +95,13 @@ def _folders_to_ship(args, out_folder, work):
     return roots
 
 
-def _stage_code(work):
-    """The job's code: this folder's scripts, the competition's metric.py and requirements.txt."""
+def _stage_code(work, args):
+    """The job's code: this folder's scripts, the competition's metric.py and requirements.txt,
+    and the script's arguments in job_args.json.
+
+    The arguments travel in a file, not as SageMaker hyperparameters, because the container
+    builds its command line from hyperparameters without quoting: an empty value such as
+    compare_adapter = "" vanished, and the script stopped with "expected one argument"."""
     stage = os.path.join(work, "job_code")
     shutil.rmtree(stage, ignore_errors=True)
     os.makedirs(stage)
@@ -104,6 +109,8 @@ def _stage_code(work):
         shutil.copy(f, stage)
     shutil.copy(os.path.join(REPO, "metric.py"), stage)
     shutil.copy(os.path.join(NOTEBOOKS, "requirements.txt"), stage)
+    with open(os.path.join(stage, "job_args.json"), "w", encoding="utf-8") as f:
+        json.dump(args, f, indent=2)
     return stage
 
 
@@ -178,7 +185,7 @@ def run_job(script, args, out_folder, *, work, bucket, run_name, instance_type="
             {"Key": "Name", "Value": owner}]
     estimator = HuggingFace(
         entry_point="job_entry.py",
-        source_dir=_stage_code(work),
+        source_dir=_stage_code(work, args),
         role=sagemaker.get_execution_role(),
         instance_type=instance_type,
         instance_count=1,
@@ -192,7 +199,8 @@ def run_job(script, args, out_folder, *, work, bucket, run_name, instance_type="
         pytorch_version="2.8",
         py_version="py312",
         output_path=f"s3://{bucket}/{os.path.basename(work)}/job-output/",
-        hyperparameters={k: v for k, v in args.items()},
+        # Only so the settings show on the job's page in the console; job_entry.py reads job_args.json.
+        hyperparameters={k: v for k, v in args.items() if str(v) != ""},
         environment=environment,
         tags=tags,
         sagemaker_session=session,
