@@ -51,6 +51,9 @@ import sys
 import time
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# Pages differ in size, so the GPU's memory gets cut into odd-sized pieces; growable segments let
+# PyTorch reuse them (the first Qwen3-VL-8B run stopped with 1.2 GB free but in pieces).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import pandas as pd
 import torch
@@ -852,7 +855,26 @@ def main():
             logging_steps=5, save_strategy="epoch", save_total_limit=1, report_to="none",
             remove_unused_columns=False, dataloader_num_workers=2, seed=args.seed,
             use_cpu=not torch.cuda.is_available())
-        trainer = Trainer(model=model, args=targs,
+        class LabelOnlyLoss(Trainer):
+            """The same loss as the model's own, computed only where there is something to learn.
+            The model's own forward scores every position (prompt, ~1000 image pieces and the
+            transcription) against the whole vocabulary, in float32: about 1.1 GB per page for
+            Qwen3-VL's 152k words, and that is where the first 8B run ran out of memory. Only the
+            transcription's positions count towards the loss, so only those are scored here."""
+
+            def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+                labels = inputs.pop("labels")
+                lm = model.get_base_model() if hasattr(model, "get_base_model") else model
+                hidden = lm.model(**inputs, use_cache=False).last_hidden_state
+                targets = labels[:, 1:]            # position t predicts token t + 1
+                keep = targets != -100
+                logits = lm.lm_head(hidden[:, :-1][keep]).float()
+                loss = torch.nn.functional.cross_entropy(logits, targets[keep], reduction="sum")
+                # Like the model's own loss: per token, over every token of the accumulated batch.
+                loss = loss / (num_items_in_batch if num_items_in_batch is not None else keep.sum().clamp(min=1))
+                return (loss, None) if return_outputs else loss
+
+        trainer = LabelOnlyLoss(model=model, args=targs,
                           train_dataset=PageDataset(items, args.data_dir, doc_ctx, opts, args.augment, args.seed,
                                                     args.rotate_train),
                           data_collator=Collator(processor), callbacks=[Watch()])
