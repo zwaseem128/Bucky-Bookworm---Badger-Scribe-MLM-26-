@@ -273,7 +273,10 @@ def load_model(model_id, max_pixels, adapter_dir=None, compare_dir=None):
     check_cudnn(dtype)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"loading {model_id} in {dtype}", flush=True)
-    model = AutoModelForImageTextToText.from_pretrained(model_id, dtype=dtype, attn_implementation="sdpa").to(device)
+    # Load straight onto the GPU. Loading to the CPU first and then moving it needs the whole model in
+    # RAM: Qwen3-VL-8B is about 17.5 GB in bf16, more than the 16 GB an ml.g5.xlarge has.
+    model = AutoModelForImageTextToText.from_pretrained(model_id, dtype=dtype, attn_implementation="sdpa",
+                                                        device_map={"": device})
     processor = AutoProcessor.from_pretrained(model_id)
     # Our own load_image already shrinks every image to max_pixels; this keeps the processor from
     # resizing it again. Qwen3-VL's processor counts pixels in its "size" dict, Qwen2.5-VL's
