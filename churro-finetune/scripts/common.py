@@ -19,6 +19,14 @@ import pandas as pd
 from PIL import Image, ImageFilter
 
 MODEL_ID = "stanford-oval/churro-3B"
+# Short names for the base models a run can start from (Notebook 2's MODEL). CHURRO-3B is
+# Qwen2.5-VL-3B trained further on historical documents; the Qwen3-VL models are general
+# vision-language models, larger and newer, with no historical-handwriting training of their own.
+MODELS = {
+    "churro": MODEL_ID,
+    "qwen3-vl-8b": "Qwen/Qwen3-VL-8B-Instruct",
+    "qwen3-vl-4b": "Qwen/Qwen3-VL-4B-Instruct",
+}
 
 # Qwen2.5-VL (which CHURRO is built on) turns every 28 x 28 pixel block into one
 # image token. Each image is resized to at most MAX_PIXELS, about a megapixel or

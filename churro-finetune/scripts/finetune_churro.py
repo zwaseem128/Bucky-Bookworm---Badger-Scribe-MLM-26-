@@ -62,6 +62,7 @@ from common import (  # noqa: E402
     MAX_PIXELS,
     MIN_PIXELS,
     MODEL_ID,
+    MODELS,
     add_postmark_guess,
     augment,
     build_prompt,
@@ -229,17 +230,26 @@ def check_cudnn(dtype):
 
 
 def load_model(model_id, max_pixels, adapter_dir=None, compare_dir=None):
-    """CHURRO-3B (and an adapter on top, if given) on the GPU, with its processor.
+    """The base model (CHURRO-3B, or another Qwen-VL such as Qwen3-VL-8B; see MODELS in common.py)
+    and an adapter on top, if given, on the GPU, with its processor.
     compare_dir loads a second adapter beside the first, named "compare"."""
     from peft import PeftModel
-    from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+    from transformers import AutoModelForImageTextToText, AutoProcessor
 
+    model_id = MODELS.get(model_id, model_id)
     dtype = pick_dtype()
     check_cudnn(dtype)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"loading {model_id} in {dtype}", flush=True)
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, dtype=dtype, attn_implementation="sdpa").to(device)
-    processor = AutoProcessor.from_pretrained(model_id, min_pixels=MIN_PIXELS, max_pixels=max_pixels)
+    model = AutoModelForImageTextToText.from_pretrained(model_id, dtype=dtype, attn_implementation="sdpa").to(device)
+    processor = AutoProcessor.from_pretrained(model_id)
+    # Our own load_image already shrinks every image to max_pixels; this keeps the processor from
+    # resizing it again. Qwen3-VL's processor counts pixels in its "size" dict, Qwen2.5-VL's
+    # (CHURRO's) in min_pixels / max_pixels, so both are set.
+    ip = processor.image_processor
+    ip.min_pixels, ip.max_pixels = MIN_PIXELS, max_pixels
+    if isinstance(getattr(ip, "size", None), dict):
+        ip.size = {"shortest_edge": MIN_PIXELS, "longest_edge": max_pixels}
     if adapter_dir:
         print(f"adding the adapter in {adapter_dir}", flush=True)
         model = PeftModel.from_pretrained(model, adapter_dir)
