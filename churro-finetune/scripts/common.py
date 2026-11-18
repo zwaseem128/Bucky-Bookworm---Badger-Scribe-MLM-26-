@@ -121,7 +121,7 @@ def catalog_context(data_dir, collections: str = "") -> dict:
     """load_metadata for a run's --rich_context collections. Stops, saying what to do, when
     collections are named but <data_dir>/metadata.csv isn't there: reading without the record a
     model was trained with would quietly score worse."""
-    if not str(collections).strip():
+    if str(collections).strip() in ("", "none"):
         return {}
     path = os.path.join(data_dir, "metadata.csv")
     ctx = load_metadata(path, collections)
@@ -384,6 +384,137 @@ def ink_chars(path, box=None) -> float:
     paper = np.asarray(small.filter(ImageFilter.GaussianBlur(20)), dtype=np.int16) > 115
     ink = ((around - grey) > 30) & paper
     return float(ink.sum()) * 4 / INK_PER_CHAR
+
+
+# --blocks: the backs of folded bills carry a few separate patches of writing (an address, a
+# docket, an amount), often each turned a different way. Each patch is found from its ink,
+# cut out with a margin and read on its own. The numbers were tuned by eye on the 17 labelled
+# Dominy pages with little ink (training pages only): they keep folds, torn edges, the scanner
+# bed and the archive's small pencil shelf numbers out, and the address panels in.
+BLOCK_CELL = 8          # ink is grouped in cells of 8 x 8 pixels of the half-size image (16 x 16 of the scan)
+BLOCK_INK = 40          # darker than its surroundings by this much (ink_chars uses 30; folds are fainter)
+BLOCK_CELL_INK = 6      # ink pixels a cell needs to count: a stroke, not specks
+BLOCK_EDGE = 20         # half-size pixels kept clear inside the sheet's edge (torn edges, the scanner bed)
+BLOCK_JOIN = 2          # cells of blank paper bridged between strokes: joins the lines of an address panel
+BLOCK_MIN_CHARS = 6     # a patch with less ink than about this many characters is a smudge or a shelf number
+BLOCK_MAX = 8           # more patches than this: not a back with a few labels, so the page is read whole
+BLOCK_PAD = 32          # scan pixels of margin around a patch when it is cut out
+BLOCK_MAX_ZOOM = 4      # a patch is enlarged at most this many times (each way) before reading
+
+
+def ink_blocks(path, box=None):
+    """Patches of writing on a sparse page: a list of (x0, y0, x1, y1, ink_chars) in the scan's
+    pixels (top to bottom, then left to right), or [] when the page has none or too many.
+
+    Ink is found as in ink_chars, a little stricter. Inked cells within BLOCK_JOIN cells of each
+    other count as one patch, so the lines of one address stay together and a docket written
+    elsewhere on the sheet is a patch of its own. Long patches one stroke thin are folds."""
+    import numpy as np
+    img = Image.open(path).convert("L")
+    ox, oy = (box[0], box[1]) if box is not None else (0, 0)
+    if box is not None:
+        img = img.crop(tuple(box))
+    full_w, full_h = img.size
+    small = img.resize((max(1, img.width // 2), max(1, img.height // 2)), Image.BILINEAR)
+    grey = np.asarray(small, dtype=np.int16)
+    around = np.asarray(small.filter(ImageFilter.GaussianBlur(10)), dtype=np.int16)
+    paper = Image.fromarray(((np.asarray(small.filter(ImageFilter.GaussianBlur(20))) > 115) * 255).astype(np.uint8))
+    for _ in range(BLOCK_EDGE // 10):
+        paper = paper.filter(ImageFilter.MinFilter(21))
+    ink = ((around - grey) > BLOCK_INK) & (np.asarray(paper) > 0)
+    c, k = BLOCK_CELL, BLOCK_JOIN
+    h, w = ink.shape[0] // c, ink.shape[1] // c
+    if not h or not w:
+        return []
+    count = ink[:h * c, :w * c].reshape(h, c, w, c).sum(axis=(1, 3))
+    inked = count >= BLOCK_CELL_INK
+    grown = np.asarray(Image.fromarray((inked * 255).astype(np.uint8)).filter(ImageFilter.MaxFilter(2 * k + 1))) > 0
+    seen = np.zeros_like(grown)
+    blocks = []
+    for sy, sx in zip(*np.nonzero(grown)):
+        if seen[sy, sx]:
+            continue
+        stack, cells = [(sy, sx)], []
+        seen[sy, sx] = True
+        while stack:
+            y, x = stack.pop()
+            cells.append((y, x))
+            for ny, nx in ((y + 1, x), (y - 1, x), (y, x + 1), (y, x - 1)):
+                if 0 <= ny < h and 0 <= nx < w and grown[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        ys, xs = zip(*cells)
+        y0, y1, x0, x1 = min(ys), max(ys) + 1, min(xs), max(xs) + 1
+        chars = float(count[y0:y1, x0:x1][inked[y0:y1, x0:x1]].sum()) * 4 / INK_PER_CHAR
+        thin = min(y1 - y0, x1 - x0) <= 2 * k + 1 and max(y1 - y0, x1 - x0) >= 4 * (2 * k + 1)
+        if chars >= BLOCK_MIN_CHARS and not thin:
+            s = 2 * c                         # cells -> scan pixels (the mask is half size)
+            blocks.append((max(0, x0 * s - BLOCK_PAD) + ox, max(0, y0 * s - BLOCK_PAD) + oy,
+                           min(full_w, x1 * s + BLOCK_PAD) + ox, min(full_h, y1 * s + BLOCK_PAD) + oy,
+                           round(chars, 1)))
+    if not blocks or len(blocks) > BLOCK_MAX:
+        return []
+    return sorted(blocks, key=lambda b: (round(b[1] / 200), b[0]))
+
+
+def block_turns(x0, y0, x1, y1):
+    """The rotations worth trying for a patch: lines of writing are wider than tall, so a wide
+    patch is upright or upside down, a tall one sideways; a square one could be any."""
+    w, h = x1 - x0, y1 - y0
+    if w >= 1.3 * h:
+        return (0, 180)
+    if h >= 1.3 * w:
+        return (90, 270)
+    return (0, 90, 180, 270)
+
+
+# --catalog_fix: names in the catalog record settle near-misses after reading ("Domeny" ->
+# "Dominy"), instead of the record joining the prompt, where the model copied names from it
+# that are not on the page.
+_ABBREV_OK = re.compile(r"[A-Za-z]+")
+
+
+def catalog_names(record: str) -> set:
+    """The capitalised words of four letters or more in a catalog record: names and places."""
+    return {w for w in _ABBREV_OK.findall(record) if len(w) >= 4 and w[0].isupper()}
+
+
+def _edits(a: str, b: str) -> int:
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _is_short_form(short: str, full: str) -> bool:
+    """'Majr' of 'Major', 'Nathl' of 'Nathaniel': the letters of short appear in full, in order."""
+    it = iter(full.lower())
+    return len(short) < len(full) and all(ch in it for ch in short.lower())
+
+
+def catalog_fix(text: str, names: set) -> str:
+    """Respell a capitalised word that is one letter off a catalog name (two for long words) as
+    that name. A word that is a shortened form of the name ('Majr', 'Nathl') is left alone: the
+    labels keep abbreviations as written. So is a word with more than one near name."""
+    if not names:
+        return text
+    lower = {n.lower() for n in names}
+
+    def fix(m):
+        word = m.group(0)
+        if len(word) < 4 or not word[0].isupper() or word.lower() in lower:
+            return word
+        limit = 1 if len(word) <= 6 else 2
+        near = {n.lower(): n for n in names
+                if n[0].lower() == word[0].lower() and abs(len(n) - len(word)) <= 1
+                and not _is_short_form(word, n) and not _is_short_form(n, word)
+                and _edits(word.lower(), n.lower()) <= limit}
+        return next(iter(near.values())) if len(near) == 1 else word
+
+    return _ABBREV_OK.sub(fix, text)
 
 
 def stopped_early(text: str, ink_estimate: float) -> bool:

@@ -58,6 +58,7 @@ from torch.utils.data import Dataset
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import (  # noqa: E402
+    BLOCK_MAX_ZOOM,
     DENSE_CHARS,
     MAX_PIXELS,
     MIN_PIXELS,
@@ -65,14 +66,19 @@ from common import (  # noqa: E402
     MODELS,
     add_postmark_guess,
     augment,
+    block_turns,
     build_prompt,
+    catalog_fix,
+    catalog_names,
     catalog_context,
     clean_output,
     cut_at_repeat,
     full_messages,
+    ink_blocks,
     ink_chars,
     join_halves,
     load_image,
+    load_metadata,
     looks_wrong,
     split_survey_label,
     stopped_early,
@@ -86,7 +92,7 @@ from common import (  # noqa: E402
 READING_SETTINGS = ("max_pixels", "max_new_tokens", "upscale", "enhance", "retry", "postmark_guess",
                     "repetition_penalty", "retry_pick", "cut_repeats", "repeat_chars",
                     "no_repeat_ngram_size", "retry_repetition_penalty", "compare_adapter", "compare_ratio",
-                    "rotations", "rotation_margin", "ink_check", "rich_context")
+                    "rotations", "rotation_margin", "ink_check", "rich_context", "blocks", "catalog_fix")
 
 # --rotations: a reading shorter than this, or a page with less ink than this many characters,
 # is also read at 90, 180 and 270 degrees. Every labelled Dominy back is under both. A dense
@@ -98,6 +104,24 @@ ROTATE_BELOW_INK = 350
 # write until it is stopped: at the full limit, three turned readings of every short page made
 # the first scoring pass of a run take over 20 minutes.
 TURNED_MAX_TOKENS = 400
+# --blocks: what a cut-out patch is told, and how long its reading may be (a patch is an address
+# or a docket: a few lines at most).
+BLOCK_HINT = ("This image is a small piece cut out of a larger sheet: one patch of writing, such as an "
+              "address, a docket or an amount. Write only the words and figures in this piece.")
+BLOCK_MAX_TOKENS = 120
+_CATALOG_NAMES = {}
+
+
+def catalog_names_for(data_dir, collections):
+    """{doc_id: names in its catalog record} for --catalog_fix, read once per data folder."""
+    key = (data_dir, collections)
+    if key not in _CATALOG_NAMES:
+        _CATALOG_NAMES[key] = {doc: catalog_names(rec) for doc, rec in
+                               load_metadata(os.path.join(data_dir, "metadata.csv"), collections).items()}
+        if not _CATALOG_NAMES[key]:
+            raise SystemExit(f"catalog_fix = {collections!r} needs the competition's metadata.csv in {data_dir} "
+                             "(it comes with the Kaggle download). Upload it there, then run this again.")
+    return _CATALOG_NAMES[key]
 
 
 def without_postmark(text):
@@ -174,6 +198,14 @@ def parse_args():
     p.add_argument("--rich_context", default="",
                    help="collections whose prompt gets the catalog record from <data_dir>/metadata.csv (title, "
                         "creator, date, summary), e.g. dominy_accounts. No other collection gets one.")
+    p.add_argument("--blocks", default="",
+                   help="collections whose sparse pages (backs) are read patch by patch: each patch of writing is "
+                        "found from its ink, turned the way its lines run, cut out, enlarged and read on its own, "
+                        "e.g. dominy_accounts")
+    p.add_argument("--catalog_fix", default="",
+                   help="collections whose readings get near-miss names respelled from the catalog record "
+                        "(metadata.csv) after reading, e.g. dominy_accounts. Unlike --rich_context, the record "
+                        "never joins the prompt.")
     p.add_argument("--init_adapter", default="",
                    help="start training from this saved adapter (e.g. a run's epoch3) instead of a new one, "
                         "with a fresh learning-rate schedule")
@@ -276,7 +308,7 @@ def flat_len(text):
 @torch.no_grad()
 def generate(model, processor, jobs, opts, batch, penalty=None, sureness=None, max_tokens=None):
     """Read a list of images: jobs are (key, image path, box, prompt, category) and, optionally,
-    a rotation in degrees. Returns {key: text}.
+    a rotation in degrees and a pixel cap for that image. Returns {key: text}.
 
     sureness, if given, is a dict that gets {key: the mean log-probability of the tokens written}:
     how sure the model was of this reading. 0 is certain; a guess is well below.
@@ -307,8 +339,8 @@ def generate(model, processor, jobs, opts, batch, penalty=None, sureness=None, m
         chunk = jobs[s:s + batch]
         texts = [processor.apply_chat_template(user_messages(j[3]), tokenize=False, add_generation_prompt=True)
                  for j in chunk]
-        images = [load_image(j[1], j[2], opts["max_pixels"], bool(opts["upscale"]), listed(opts["enhance"], j[4]),
-                             rotate=j[5] if len(j) > 5 else 0)
+        images = [load_image(j[1], j[2], min(opts["max_pixels"], j[6]) if len(j) > 6 else opts["max_pixels"],
+                             bool(opts["upscale"]), listed(opts["enhance"], j[4]), rotate=j[5] if len(j) > 5 else 0)
                   for j in chunk]
         enc = processor(text=texts, images=images, padding=True, return_tensors="pt").to(model.device)
         if sureness is not None:
@@ -362,7 +394,8 @@ def read_pages(model, processor, page_ids, parts, data_dir, doc_ctx, categories,
             info[key] = {"expected": 0 if inky else expected.get(f"{cat}/{'half' if box else 'page'}", 0),
                          "size": (int(r.get("width") or 0), int(r.get("height") or 0)),
                          "turned": turned, "inky": inky, "rotation": 0,
-                         "ink": ink_chars(path, box) if (turned or inky) else 0.0}
+                         "ink": ink_chars(path, box) if (turned or inky or listed(opts.get("blocks", ""), cat))
+                         else 0.0}
     sure = {} if any(i["turned"] for i in info.values()) else None
     texts = generate(model, processor, jobs, opts, batch, sureness=sure)
     retried = set()
@@ -390,10 +423,47 @@ def read_pages(model, processor, page_ids, parts, data_dir, doc_ctx, categories,
                     info[key]["rotation"] = best
                     retried.add(key[0])
 
+    # Sparse pages (--blocks): each patch of writing read on its own, the way its lines run. A back
+    # often has an address one way and a docket another; turning the whole sheet once loses one.
+    block_set = opts.get("blocks", "")
+    if block_set:
+        again, found = [], {}
+        for key, path, box, prompt, cat in jobs:
+            if not listed(block_set, cat) or box is not None or info[key]["ink"] >= ROTATE_BELOW_INK:
+                continue
+            patches = ink_blocks(path)
+            if not patches:
+                continue
+            found[key] = patches
+            piece_prompt = build_prompt(cat) + "\n" + BLOCK_HINT    # no catalog record: it got copied
+            for n, (x0, y0, x1, y1, _) in enumerate(patches):
+                cap = (x1 - x0) * (y1 - y0) * BLOCK_MAX_ZOOM ** 2
+                again += [((key, "block", n, deg), path, (x0, y0, x1, y1), piece_prompt, cat, deg, cap)
+                          for deg in block_turns(x0, y0, x1, y1)]
+        if again:
+            piece_sure = {}
+            pieces_read = generate(model, processor, again, opts, batch, sureness=piece_sure,
+                                   max_tokens=min(int(opts["max_new_tokens"]), BLOCK_MAX_TOKENS))
+            for key, patches in found.items():
+                kept = []
+                for n, (x0, y0, x1, y1, chars) in enumerate(patches):
+                    options = [(piece_sure[(key, "block", n, deg)], pieces_read[(key, "block", n, deg)])
+                               for deg in block_turns(x0, y0, x1, y1)]
+                    # a reading far longer than the patch's ink is a guess, however sure the model is
+                    options = [o for o in options if o[1].strip() and not looks_wrong(o[1], 0)
+                               and flat_len(o[1]) <= 4 * chars + 30]
+                    if options:
+                        kept.append(max(options)[1].strip())
+                if kept:
+                    texts[key] = "\n".join(kept)
+                    info[key]["blocks"] = len(kept)
+                    retried.add(key[0])
+
     if opts["retry"]:
         again = []
         for key, path, box, prompt, cat in jobs:
-            if info[key]["rotation"] == 0 and looks_wrong(texts[key], info[key]["expected"]):
+            if info[key]["rotation"] == 0 and not info[key].get("blocks") \
+                    and looks_wrong(texts[key], info[key]["expected"]):
                 w, h = info[key]["size"]
                 for half, half_box in zip(("top", "bottom"), top_bottom(box, w, h)):
                     again.append(((key, half), path, half_box, prompt, cat))
@@ -417,7 +487,8 @@ def read_pages(model, processor, page_ids, parts, data_dir, doc_ctx, categories,
     # reads well, and gets the whole pixel budget to itself.
     job_of = {j[0]: j for j in jobs}
     pieces = {key: [(job_of[key][2], texts[key])] for key in job_of
-              if info[key]["inky"] and info[key]["rotation"] == 0 and all(info[key]["size"])}
+              if info[key]["inky"] and info[key]["rotation"] == 0 and not info[key].get("blocks")
+              and all(info[key]["size"])}
     for depth in range(2):
         again, short = [], []
         for key, plist in pieces.items():
@@ -467,6 +538,9 @@ def read_pages(model, processor, page_ids, parts, data_dir, doc_ctx, categories,
     for pid in page_ids:
         keys = sorted(k for k in texts if k[0] == pid)
         text = clean_output("\n".join(texts[k] for k in keys), categories[pid])
+        if listed(opts.get("catalog_fix", ""), categories[pid]):
+            names = catalog_names_for(data_dir, opts["catalog_fix"]).get(pid.rsplit("_", 1)[0], set())
+            text = catalog_fix(text, names)
         if listed(opts.get("cut_repeats", ""), categories[pid]):
             text = cut_at_repeat(text, int(opts.get("repeat_chars", 22)))
         if opts["postmark_guess"] and keys:
@@ -477,7 +551,8 @@ def read_pages(model, processor, page_ids, parts, data_dir, doc_ctx, categories,
             first = info[keys[0]]
             notes[pid] = {"rotation": first["rotation"], "ink_chars": round(first["ink"]),
                           "sureness": round(sure[keys[0]], 3) if sure is not None and keys[0] in sure else "",
-                          "rotations_tried": json.dumps(first["tried"]) if "tried" in first else ""}
+                          "rotations_tried": json.dumps(first["tried"]) if "tried" in first else "",
+                          "blocks": first.get("blocks", "")}
     return result, retried
 
 
