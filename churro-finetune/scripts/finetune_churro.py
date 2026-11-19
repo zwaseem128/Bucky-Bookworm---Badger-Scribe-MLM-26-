@@ -489,9 +489,72 @@ def read_pages(model, processor, page_ids, parts, data_dir, doc_ctx, categories,
                     info[key]["blocks"] = len(kept)
                     retried.add(key[0])
 
-    # Sparse pages (--vote): the readings above, plus the whole page with the contrast stretch
-    # flipped and a few sampled readings of the whole page and of the patches, and the one closest
-    # to all the others is kept. Writing that is really there comes out much the same in every
+    if opts["retry"]:
+        again = []
+        for key, path, box, prompt, cat in jobs:
+            if info[key]["rotation"] == 0 and not info[key].get("blocks") \
+                    and looks_wrong(texts[key], info[key]["expected"]):
+                w, h = info[key]["size"]
+                for half, half_box in zip(("top", "bottom"), top_bottom(box, w, h)):
+                    again.append(((key, half), path, half_box, prompt, cat))
+        if again:
+            second = generate(model, processor, again, opts, batch, opts.get("retry_repetition_penalty") or None)
+            for key in {k for (k, _), *_ in again}:
+                joined = (second[(key, "top")] + "\n" + second[(key, "bottom")]).strip()
+                exp = info[key]["expected"]
+                if opts.get("retry_pick", "longer") == "closer" and exp > 0:
+                    # A reading stuck repeating is long, so "longer" would keep the worse one.
+                    off = lambda t: abs(math.log((len(" ".join(t.split())) + 1) / (exp + 1)))
+                    better = off(joined) < off(texts[key])
+                else:
+                    better = len(joined) > len(texts[key])
+                if not looks_wrong(joined, exp) or better:
+                    texts[key] = joined
+                    retried.add(key[0])
+
+    # Dense pages that stopped early (--ink_check): read in halves, and a half that is still far
+    # short of its ink in halves again. Each piece is then about as long as the pages the model
+    # reads well, and gets the whole pixel budget to itself.
+    job_of = {j[0]: j for j in jobs}
+    pieces = {key: [(job_of[key][2], texts[key])] for key in job_of
+              if info[key]["inky"] and info[key]["rotation"] == 0 and not info[key].get("blocks")
+              and all(info[key]["size"])}
+    for depth in range(2):
+        again, short = [], []
+        for key, plist in pieces.items():
+            _, path, _, prompt, cat = job_of[key]
+            w, h = info[key]["size"]
+            for n, (box, text) in enumerate(plist):
+                ink = info[key]["ink"] if len(plist) == 1 else ink_chars(path, box)
+                if stopped_early(text, ink):
+                    halves = top_bottom(box, w, h, overlap=0.03)
+                    short.append((key, n, halves))
+                    again += [((key, depth, n, half), path, half_box, prompt, cat)
+                              for half, half_box in zip(("top", "bottom"), halves)]
+        if not again:
+            break
+        second = generate(model, processor, again, opts, batch)
+        split = False
+        for key, n, halves in sorted(short, key=lambda x: -x[1]):   # last piece first, so positions hold
+            top, bottom = second[(key, depth, n, "top")], second[(key, depth, n, "bottom")]
+            joined = join_halves(top, bottom)
+            if flat_len(joined) > 1.2 * flat_len(pieces[key][n][1]) and not looks_wrong(joined, 0):
+                pieces[key][n:n + 1] = [(halves[0], top), (halves[1], bottom)]
+                retried.add(key[0])
+                split = True
+        if not split:
+            break
+    for key, plist in pieces.items():
+        if len(plist) > 1:
+            text = plist[0][1]
+            for _, more in plist[1:]:
+                text = join_halves(text, more)
+            texts[key] = text
+
+    # Sparse pages (--vote): the reading kept so far (after every step above, the retry included),
+    # the readings it was chosen from, the whole page with the contrast stretch flipped, and a few
+    # sampled readings of the whole page and of the patches; the one closest to all the others is
+    # kept. Writing that is really there comes out much the same in every
     # reading; a guess ("Mr Dominy / Easthampton / $25") comes out different each time.
     vote_set = opts.get("vote", "")
     voters = [j for j in jobs if listed(vote_set, j[4]) and j[2] is None and info[j[0]]["ink"] < ROTATE_BELOW_INK] \
@@ -562,68 +625,6 @@ def read_pages(model, processor, page_ids, parts, data_dir, doc_ctx, categories,
             if best != 0:
                 texts[key] = ok[best][1]
                 retried.add(key[0])
-
-    if opts["retry"]:
-        again = []
-        for key, path, box, prompt, cat in jobs:
-            if info[key]["rotation"] == 0 and not info[key].get("blocks") and not info[key].get("voted") \
-                    and looks_wrong(texts[key], info[key]["expected"]):
-                w, h = info[key]["size"]
-                for half, half_box in zip(("top", "bottom"), top_bottom(box, w, h)):
-                    again.append(((key, half), path, half_box, prompt, cat))
-        if again:
-            second = generate(model, processor, again, opts, batch, opts.get("retry_repetition_penalty") or None)
-            for key in {k for (k, _), *_ in again}:
-                joined = (second[(key, "top")] + "\n" + second[(key, "bottom")]).strip()
-                exp = info[key]["expected"]
-                if opts.get("retry_pick", "longer") == "closer" and exp > 0:
-                    # A reading stuck repeating is long, so "longer" would keep the worse one.
-                    off = lambda t: abs(math.log((len(" ".join(t.split())) + 1) / (exp + 1)))
-                    better = off(joined) < off(texts[key])
-                else:
-                    better = len(joined) > len(texts[key])
-                if not looks_wrong(joined, exp) or better:
-                    texts[key] = joined
-                    retried.add(key[0])
-
-    # Dense pages that stopped early (--ink_check): read in halves, and a half that is still far
-    # short of its ink in halves again. Each piece is then about as long as the pages the model
-    # reads well, and gets the whole pixel budget to itself.
-    job_of = {j[0]: j for j in jobs}
-    pieces = {key: [(job_of[key][2], texts[key])] for key in job_of
-              if info[key]["inky"] and info[key]["rotation"] == 0 and not info[key].get("blocks")
-              and not info[key].get("voted") and all(info[key]["size"])}
-    for depth in range(2):
-        again, short = [], []
-        for key, plist in pieces.items():
-            _, path, _, prompt, cat = job_of[key]
-            w, h = info[key]["size"]
-            for n, (box, text) in enumerate(plist):
-                ink = info[key]["ink"] if len(plist) == 1 else ink_chars(path, box)
-                if stopped_early(text, ink):
-                    halves = top_bottom(box, w, h, overlap=0.03)
-                    short.append((key, n, halves))
-                    again += [((key, depth, n, half), path, half_box, prompt, cat)
-                              for half, half_box in zip(("top", "bottom"), halves)]
-        if not again:
-            break
-        second = generate(model, processor, again, opts, batch)
-        split = False
-        for key, n, halves in sorted(short, key=lambda x: -x[1]):   # last piece first, so positions hold
-            top, bottom = second[(key, depth, n, "top")], second[(key, depth, n, "bottom")]
-            joined = join_halves(top, bottom)
-            if flat_len(joined) > 1.2 * flat_len(pieces[key][n][1]) and not looks_wrong(joined, 0):
-                pieces[key][n:n + 1] = [(halves[0], top), (halves[1], bottom)]
-                retried.add(key[0])
-                split = True
-        if not split:
-            break
-    for key, plist in pieces.items():
-        if len(plist) > 1:
-            text = plist[0][1]
-            for _, more in plist[1:]:
-                text = join_halves(text, more)
-            texts[key] = text
 
     if opts.get("compare_adapter"):
         # A second reading with another adapter (e.g. another epoch). Two adapters rarely run away
