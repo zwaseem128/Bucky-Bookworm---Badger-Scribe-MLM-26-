@@ -95,7 +95,8 @@ from common import (  # noqa: E402
 READING_SETTINGS = ("max_pixels", "max_new_tokens", "upscale", "enhance", "retry", "postmark_guess",
                     "repetition_penalty", "retry_pick", "cut_repeats", "repeat_chars",
                     "no_repeat_ngram_size", "retry_repetition_penalty", "compare_adapter", "compare_ratio",
-                    "rotations", "rotation_margin", "ink_check", "rich_context", "blocks", "catalog_fix")
+                    "rotations", "rotation_margin", "ink_check", "rich_context", "blocks", "catalog_fix",
+                    "vote", "vote_samples", "vote_temperature")
 
 # --rotations: a reading shorter than this, or a page with less ink than this many characters,
 # is also read at 90, 180 and 270 degrees. Every labelled Dominy back is under both. A dense
@@ -209,6 +210,13 @@ def parse_args():
                    help="collections whose readings get near-miss names respelled from the catalog record "
                         "(metadata.csv) after reading, e.g. dominy_accounts. Unlike --rich_context, the record "
                         "never joins the prompt.")
+    p.add_argument("--vote", default="",
+                   help="collections whose sparse pages (backs) are read several ways (whole and upright, turned, "
+                        "patch by patch, with the contrast stretch flipped, and a few sampled readings of each) "
+                        "and the reading that agrees most with the others is kept, e.g. dominy_accounts")
+    p.add_argument("--vote_samples", type=int, default=4,
+                   help="--vote: sampled readings of the whole page and of the patches, each (0 = greedy ones only)")
+    p.add_argument("--vote_temperature", type=float, default=0.7, help="--vote: how freely the samples are drawn")
     p.add_argument("--init_adapter", default="",
                    help="start training from this saved adapter (e.g. a run's epoch3) instead of a new one, "
                         "with a fresh learning-rate schedule")
@@ -311,14 +319,24 @@ def flat_len(text):
     return len(" ".join(str(text).split()))
 
 
+def patch_reading_ok(text, chars):
+    """A patch's reading is kept only if it has something in it, isn't stuck repeating, and isn't
+    far longer than the patch's ink: a long reading of a small patch is a guess, however sure."""
+    return bool(str(text).strip()) and not looks_wrong(text, 0) and flat_len(text) <= 4 * chars + 30
+
+
 @torch.no_grad()
-def generate(model, processor, jobs, opts, batch, penalty=None, sureness=None, max_tokens=None):
+def generate(model, processor, jobs, opts, batch, penalty=None, sureness=None, max_tokens=None, temperature=0.0):
     """Read a list of images: jobs are (key, image path, box, prompt, category) and, optionally,
     a rotation in degrees and a pixel cap for that image. Returns {key: text}.
 
     sureness, if given, is a dict that gets {key: the mean log-probability of the tokens written}:
     how sure the model was of this reading. 0 is certain; a guess is well below.
-    max_tokens, if given, replaces the run's max_new_tokens for these readings."""
+    max_tokens, if given, replaces the run's max_new_tokens for these readings.
+    temperature above 0 samples each token instead of taking the likeliest (--vote), so the same
+    job twice gives two different readings."""
+    sampling = {"do_sample": True, "temperature": temperature, "top_p": 0.95} if temperature > 0 \
+        else {"do_sample": False}
     out_texts = {}
     jobs = sorted(jobs, key=lambda j: (j[2] is not None, j[3]))   # similar images together: less padding
     processor.tokenizer.padding_side = "left"
@@ -352,7 +370,7 @@ def generate(model, processor, jobs, opts, batch, penalty=None, sureness=None, m
         if sureness is not None:
             watch = Sureness()
             extra = {"logits_processor": LogitsProcessorList([watch])}
-        out = model.generate(**enc, max_new_tokens=int(max_tokens or opts["max_new_tokens"]), do_sample=False,
+        out = model.generate(**enc, max_new_tokens=int(max_tokens or opts["max_new_tokens"]), **sampling,
                              repetition_penalty=penalty or opts.get("repetition_penalty", 1.05),
                              no_repeat_ngram_size=int(opts.get("no_repeat_ngram_size", 0) or 0), use_cache=True,
                              **extra)
@@ -400,10 +418,12 @@ def read_pages(model, processor, page_ids, parts, data_dir, doc_ctx, categories,
             info[key] = {"expected": 0 if inky else expected.get(f"{cat}/{'half' if box else 'page'}", 0),
                          "size": (int(r.get("width") or 0), int(r.get("height") or 0)),
                          "turned": turned, "inky": inky, "rotation": 0,
-                         "ink": ink_chars(path, box) if (turned or inky or listed(opts.get("blocks", ""), cat))
+                         "ink": ink_chars(path, box) if (turned or inky or listed(opts.get("blocks", ""), cat)
+                                                         or listed(opts.get("vote", ""), cat))
                          else 0.0}
     sure = {} if any(i["turned"] for i in info.values()) else None
     texts = generate(model, processor, jobs, opts, batch, sureness=sure)
+    upright = dict(texts)   # for --vote
     retried = set()
 
     if sure is not None:
@@ -431,6 +451,8 @@ def read_pages(model, processor, page_ids, parts, data_dir, doc_ctx, categories,
 
     # Sparse pages (--blocks): each patch of writing read on its own, the way its lines run. A back
     # often has an address one way and a docket another; turning the whole sheet once loses one.
+    whole = dict(texts)     # the whole page, the way it was kept (for --vote)
+    picked = {}             # {key: [the job of each patch kept, at the way it was read]} (for --vote)
     block_set = opts.get("blocks", "")
     if block_set:
         again, found = [], {}
@@ -450,25 +472,101 @@ def read_pages(model, processor, page_ids, parts, data_dir, doc_ctx, categories,
             piece_sure = {}
             pieces_read = generate(model, processor, again, opts, batch, sureness=piece_sure,
                                    max_tokens=min(int(opts["max_new_tokens"]), BLOCK_MAX_TOKENS))
+            job_by_key = {j[0]: j for j in again}
             for key, patches in found.items():
                 kept = []
                 for n, (x0, y0, x1, y1, chars) in enumerate(patches):
-                    options = [(piece_sure[(key, "block", n, deg)], pieces_read[(key, "block", n, deg)])
+                    options = [(piece_sure[(key, "block", n, deg)], pieces_read[(key, "block", n, deg)], deg)
                                for deg in block_turns(x0, y0, x1, y1)]
                     # a reading far longer than the patch's ink is a guess, however sure the model is
-                    options = [o for o in options if o[1].strip() and not looks_wrong(o[1], 0)
-                               and flat_len(o[1]) <= 4 * chars + 30]
+                    options = [o for o in options if o[1].strip() and patch_reading_ok(o[1], chars)]
                     if options:
-                        kept.append(max(options)[1].strip())
+                        best = max(options)
+                        kept.append(best[1].strip())
+                        picked.setdefault(key, []).append((job_by_key[(key, "block", n, best[2])], chars))
                 if kept:
                     texts[key] = "\n".join(kept)
                     info[key]["blocks"] = len(kept)
                     retried.add(key[0])
 
+    # Sparse pages (--vote): the readings above, plus the whole page with the contrast stretch
+    # flipped and a few sampled readings of the whole page and of the patches, and the one closest
+    # to all the others is kept. Writing that is really there comes out much the same in every
+    # reading; a guess ("Mr Dominy / Easthampton / $25") comes out different each time.
+    vote_set = opts.get("vote", "")
+    voters = [j for j in jobs if listed(vote_set, j[4]) and j[2] is None and info[j[0]]["ink"] < ROTATE_BELOW_INK] \
+        if vote_set else []
+    if voters:
+        n_samples = int(opts.get("vote_samples", 4) or 0)
+        heat = float(opts.get("vote_temperature", 0.7) or 0.7)
+        cap = min(int(opts["max_new_tokens"]), TURNED_MAX_TOKENS)
+        flip = {}
+        for enhanced in (True, False):   # the same pages, with the contrast stretch the other way
+            group = [(key, path, box, prompt, cat, info[key]["rotation"]) for key, path, box, prompt, cat in voters
+                     if bool(listed(opts["enhance"], cat)) == enhanced]
+            if group:
+                flip.update(generate(model, processor, group, dict(opts, enhance="" if enhanced else "all"), batch,
+                                     max_tokens=cap))
+        sampled = {}
+        if n_samples:
+            torch.manual_seed(1234)   # the same samples every time the page is read
+            sampled = generate(model, processor, [((key, "whole", i), path, box, prompt, cat, info[key]["rotation"])
+                                                  for key, path, box, prompt, cat in voters for i in range(n_samples)],
+                               opts, batch, max_tokens=cap, temperature=heat)
+            patch_jobs = [((key, "patch", n, i), *job[1:]) for key, *_ in voters
+                          for n, (job, _) in enumerate(picked.get(key, [])) for i in range(n_samples)]
+            if patch_jobs:
+                sampled.update(generate(model, processor, patch_jobs, opts, batch, temperature=heat,
+                                        max_tokens=min(int(opts["max_new_tokens"]), BLOCK_MAX_TOKENS)))
+        _, normalize = page_cer_function()
+        import metric   # importable now: page_cer_function put the repository on the path
+
+        def apart(a, b):
+            """0 = the same text, 1 = nothing alike. Both ways the same: the competition's CER divides
+            by the label's length and stops at 1, so as a judge it would favour a short reading of one
+            patch over a full reading of the page."""
+            a, b = normalize(a), normalize(b)
+            return metric.levenshtein(a, b) / max(1, len(a), len(b))
+
+        for key, path, box, prompt, cat in voters:
+            ink = info[key]["ink"]
+            rot = info[key]["rotation"]
+            kept_as = "patches" if info[key].get("blocks") else f"turned {rot}" if rot else "whole"
+            readings = [(kept_as, texts[key])]                       # first: it wins a tie
+            if info[key].get("blocks"):
+                readings.append((f"turned {rot}" if rot else "whole", whole[key]))
+            if rot:
+                readings.append(("upright", upright[key]))
+            readings.append(("contrast flipped", flip[key]))
+            readings += [("whole sample", sampled[(key, "whole", i)]) for i in range(n_samples)]
+            for i in range(n_samples if key in picked else 0):
+                bits = [sampled[(key, "patch", n, i)].strip() for n, (_, chars) in enumerate(picked[key])
+                        if patch_reading_ok(sampled[(key, "patch", n, i)], chars)]
+                readings.append(("patch sample", "\n".join(b for b in bits if b)))
+            ok =[(name, t) for name, t in readings if t.strip() and not looks_wrong(t, 0)
+                  and (not ink or flat_len(t) <= 4 * ink + 30)]
+            if len(ok) < 3:
+                continue
+            # How far each reading is from the others. The whole-page readings and the patch readings
+            # count half each, however many of each there are, so neither way of reading outvotes the
+            # other by numbers alone. The kept reading wins a tie, since it comes first.
+            view = ["patch" if name.startswith("patch") else "page" for name, _ in ok]
+            far = []
+            for i, (_, t) in enumerate(ok):
+                means = [sum(apart(t, o) for j, (_, o) in enumerate(ok) if j != i and view[j] == v) / n
+                         for v in ("page", "patch")
+                         for n in [sum(1 for j in range(len(ok)) if j != i and view[j] == v)] if n]
+                far.append(sum(means) / len(means))
+            best = min(range(len(ok)), key=lambda i: (far[i], i))
+            info[key]["voted"] = f"{ok[best][0]} ({far[best]:.2f} apart, {len(ok)} readings)"
+            if best != 0:
+                texts[key] = ok[best][1]
+                retried.add(key[0])
+
     if opts["retry"]:
         again = []
         for key, path, box, prompt, cat in jobs:
-            if info[key]["rotation"] == 0 and not info[key].get("blocks") \
+            if info[key]["rotation"] == 0 and not info[key].get("blocks") and not info[key].get("voted") \
                     and looks_wrong(texts[key], info[key]["expected"]):
                 w, h = info[key]["size"]
                 for half, half_box in zip(("top", "bottom"), top_bottom(box, w, h)):
@@ -494,7 +592,7 @@ def read_pages(model, processor, page_ids, parts, data_dir, doc_ctx, categories,
     job_of = {j[0]: j for j in jobs}
     pieces = {key: [(job_of[key][2], texts[key])] for key in job_of
               if info[key]["inky"] and info[key]["rotation"] == 0 and not info[key].get("blocks")
-              and all(info[key]["size"])}
+              and not info[key].get("voted") and all(info[key]["size"])}
     for depth in range(2):
         again, short = [], []
         for key, plist in pieces.items():
@@ -558,7 +656,7 @@ def read_pages(model, processor, page_ids, parts, data_dir, doc_ctx, categories,
             notes[pid] = {"rotation": first["rotation"], "ink_chars": round(first["ink"]),
                           "sureness": round(sure[keys[0]], 3) if sure is not None and keys[0] in sure else "",
                           "rotations_tried": json.dumps(first["tried"]) if "tried" in first else "",
-                          "blocks": first.get("blocks", "")}
+                          "blocks": first.get("blocks", ""), "vote": first.get("voted", "")}
     return result, retried
 
 
