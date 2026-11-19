@@ -22,10 +22,14 @@ MODEL_ID = "stanford-oval/churro-3B"
 # Short names for the base models a run can start from (Notebook 2's MODEL). CHURRO-3B is
 # Qwen2.5-VL-3B trained further on historical documents; the Qwen3-VL models are general
 # vision-language models, larger and newer, with no historical-handwriting training of their own.
+# olmOCR-2 (Allen AI, Apache-2.0) is Qwen2.5-VL-7B trained further for document OCR: the same
+# family as CHURRO, more than twice its size, and with the same tokenizer, chat template and image
+# settings (checked 18 Nov). Another team's write-up found it better than CHURRO on account books.
 MODELS = {
     "churro": MODEL_ID,
     "qwen3-vl-8b": "Qwen/Qwen3-VL-8B-Instruct",
     "qwen3-vl-4b": "Qwen/Qwen3-VL-4B-Instruct",
+    "olmocr-2-7b": "allenai/olmOCR-2-7B-1025",
 }
 
 # Qwen2.5-VL (which CHURRO is built on) turns every 28 x 28 pixel block into one
@@ -213,9 +217,14 @@ def training_text(text: str, category: str) -> str:
 _PLAIN = str.maketrans({"—": "-", "–": "-", "‘": "'", "’": "'", "“": '"', "”": '"', "„": '"', "…": "...", "|": " ",
                         "×": "x", "✓": "", "✔": "", "✗": "", "✘": ""})
 _FRACTIONS = {"1/2": "½", "1/4": "¼", "3/4": "¾"}
+# olmOCR was trained to open every answer with a YAML header (primary_language, is_rotation_valid,
+# ...) between --- lines. Until fine-tuning teaches it our plain answers, that header is not page
+# text. No label starts with "---".
+_OLMOCR_HEADER = re.compile(r"\A\s*---\s*\n(?:[a-z_]+:[^\n]*\n)+---\s*(?:\n|\Z)")
 
 
 def clean_output(text: str, category: str = "", max_chars: int = 3000) -> str:
+    text = _OLMOCR_HEADER.sub("", text, count=1)
     text = text.translate(_PLAIN)
     text = re.sub(r"```[a-z]*", "", text)                  # markdown code fences
     text = text.replace("**", "").replace("__", "")        # markdown bold
