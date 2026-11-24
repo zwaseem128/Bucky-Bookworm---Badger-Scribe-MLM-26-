@@ -74,6 +74,7 @@ from common import (  # noqa: E402
     catalog_fix,
     catalog_names,
     catalog_context,
+    chat_text,
     clean_output,
     cut_at_repeat,
     full_messages,
@@ -236,6 +237,9 @@ def parse_args():
                    help="1 = also keep the adapter of every epoch, in epoch1/, epoch2/, ...")
     # --- scoring ---
     p.add_argument("--dev_pages", type=int, default=0, help="dev pages scored at the end; 0 = all")
+    p.add_argument("--dev_sample", type=int, default=0,
+                   help="score only this many dev pages per collection, spread evenly through them: a quick, "
+                        "cheap gauge of a model (0 = all)")
     p.add_argument("--curve_pages", type=int, default=3, help="dev pages per collection scored after every epoch (0 = none)")
     p.add_argument("--eval_batch", type=int, default=4, help="images read at once")
     p.add_argument("--seed", type=int, default=42)
@@ -286,8 +290,16 @@ def load_model(model_id, max_pixels, adapter_dir=None, compare_dir=None):
     print(f"loading {model_id} in {dtype}", flush=True)
     # Load straight onto the GPU. Loading to the CPU first and then moving it needs the whole model in
     # RAM: Qwen3-VL-8B is about 17.5 GB in bf16, more than the 16 GB an ml.g5.xlarge has.
+    # A machine with several GPUs (ml.g6e.12xlarge has four) gets the model spread over them, layer
+    # by layer: the only way Qwen3.8-27B (56 GB in bf16) fits, since no single GPU here has more
+    # than 48 GB. A page then passes from one GPU to the next, so it is no faster than one GPU.
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
     model = AutoModelForImageTextToText.from_pretrained(model_id, dtype=dtype, attn_implementation="sdpa",
-                                                        device_map={"": device})
+                                                        device_map="auto" if n_gpus > 1 else {"": device})
+    if n_gpus > 1:
+        used = sorted({str(d) for d in getattr(model, "hf_device_map", {}).values()})
+        print(f"spread over {len(used)} of {n_gpus} GPUs: " + ", ".join(
+            f"cuda:{i} {torch.cuda.memory_allocated(i) / 1e9:.0f} GB" for i in range(n_gpus)), flush=True)
     processor = AutoProcessor.from_pretrained(model_id)
     # Our own load_image already shrinks every image to max_pixels; this keeps the processor from
     # resizing it again. Qwen3-VL's processor counts pixels in its "size" dict, Qwen2.5-VL's
@@ -361,8 +373,7 @@ def generate(model, processor, jobs, opts, batch, penalty=None, sureness=None, m
         stops.discard(None)
     for s in range(0, len(jobs), batch):
         chunk = jobs[s:s + batch]
-        texts = [processor.apply_chat_template(user_messages(j[3]), tokenize=False, add_generation_prompt=True)
-                 for j in chunk]
+        texts = [chat_text(processor, user_messages(j[3]), add_generation_prompt=True) for j in chunk]
         images = [load_image(j[1], j[2], min(opts["max_pixels"], j[6]) if len(j) > 6 else opts["max_pixels"],
                              bool(opts["upscale"]), listed(opts["enhance"], j[4]), rotate=j[5] if len(j) > 5 else 0)
                   for j in chunk]
@@ -757,12 +768,12 @@ class Collator:
         proc = self.processor
         proc.tokenizer.padding_side = "right"
         images = [b["image"] for b in batch]
-        full = [proc.apply_chat_template(full_messages(b["prompt"], b["answer"]), tokenize=False) for b in batch]
+        full = [chat_text(proc, full_messages(b["prompt"], b["answer"])) for b in batch]
         enc = proc(text=full, images=images, padding=True, return_tensors="pt")
         labels = enc["input_ids"].clone()
         labels[enc["attention_mask"] == 0] = -100
         for i, b in enumerate(batch):
-            prompt = proc.apply_chat_template(user_messages(b["prompt"]), tokenize=False, add_generation_prompt=True)
+            prompt = chat_text(proc, user_messages(b["prompt"]), add_generation_prompt=True)
             n_prompt = proc(text=[prompt], images=[images[i]], return_tensors="pt")["input_ids"].shape[1]
             labels[i, :n_prompt] = -100
         if len(self.hash_ids):
@@ -787,6 +798,11 @@ def as_training_items(pages, parts):
         else:
             rows.append({**base, "image": prs[0]["image"], "box": "", "text": text})
     return pd.DataFrame(rows, columns=["page_id", "doc_id", "category", "image", "box", "text"])
+
+
+def spread(n, k):
+    """k positions spread evenly over n rows, first and last included (all of them if k >= n)."""
+    return list(range(n)) if k >= n else sorted({round(i * (n - 1) / max(1, k - 1)) for i in range(k)})
 
 
 def per_category(df, pick):
@@ -860,6 +876,8 @@ def main():
     items = oversampled(items, args.oversample)
     if args.dev_pages:
         dev = per_category(dev, lambda g: g.sort_values("page_id").head(max(1, args.dev_pages // 3)))
+    if args.dev_sample:
+        dev = per_category(dev, lambda g: g.sort_values("page_id").iloc[spread(len(g), args.dev_sample)])
     curve_dev = per_category(dev, lambda g: g.sort_values("page_id").head(args.curve_pages)) \
         if args.curve_pages else dev.iloc[0:0]
     print(f"training images per epoch: {len(items)} ({', '.join(f'{c} {n}' for c, n in items.category.value_counts().items())}); "
@@ -904,6 +922,11 @@ def main():
         # LoRA on the language model's attention and MLP layers; with --train_vision 1,
         # also on the image encoder's ("visual") blocks.
         layers = "q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj"
+        if any(name.endswith("linear_attn.in_proj_qkv") for name, _ in model.named_modules()):
+            # Qwen3.8: three of every four language layers use another kind of attention, whose
+            # layers have other names. Without these the adapter would reach the attention of
+            # only a quarter of the layers.
+            layers += "|in_proj_qkv|in_proj_z|out_proj"
         target = rf".*\.(?:{layers}|qkv|attn\.proj)$" if args.train_vision else rf"^(?!.*visual).*\.(?:{layers})$"
         if args.init_adapter:
             # Carry on from what a saved adapter already knows. Its layers and size come from the
@@ -946,10 +969,19 @@ def main():
         ckpt_dir = os.path.join(args.out_dir, "checkpoints")
         last = get_last_checkpoint(ckpt_dir) if os.path.isdir(ckpt_dir) else None
         print(f"checkpoints -> {ckpt_dir}; resuming from {last or 'nothing (fresh run)'}", flush=True)
+        # The first 3% of the steps warm the learning rate up. transformers 5 (which Qwen3.8 needs)
+        # dropped warmup_ratio, so there the same number of steps is worked out here.
+        import inspect
+        if "warmup_ratio" in inspect.signature(TrainingArguments.__init__).parameters:
+            warmup = {"warmup_ratio": 0.03}
+        else:
+            batches = math.ceil(len(items) / args.batch_size)
+            updates = max(batches // args.grad_accum + int(batches % args.grad_accum > 0), 1)
+            warmup = {"warmup_steps": math.ceil(math.ceil(args.epochs * updates) * 0.03)}
         targs = TrainingArguments(
             output_dir=ckpt_dir, num_train_epochs=args.epochs, per_device_train_batch_size=args.batch_size,
             gradient_accumulation_steps=args.grad_accum, learning_rate=args.lr, lr_scheduler_type="cosine",
-            warmup_ratio=0.03, weight_decay=0.0, bf16=dtype == torch.bfloat16, fp16=dtype == torch.float16,
+            **warmup, weight_decay=0.0, bf16=dtype == torch.bfloat16, fp16=dtype == torch.float16,
             gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False},
             logging_steps=5, save_strategy="epoch", save_total_limit=1, report_to="none",
             remove_unused_columns=False, dataloader_num_workers=2, seed=args.seed,
@@ -965,10 +997,11 @@ def main():
                 labels = inputs.pop("labels")
                 lm = model.get_base_model() if hasattr(model, "get_base_model") else model
                 hidden = lm.model(**inputs, use_cache=False).last_hidden_state
-                targets = labels[:, 1:]            # position t predicts token t + 1
+                # (.to: a model spread over several GPUs gives its result on the last one)
+                targets = labels[:, 1:].to(hidden.device)   # position t predicts token t + 1
                 keep = targets != -100
                 logits = lm.lm_head(hidden[:, :-1][keep]).float()
-                loss = torch.nn.functional.cross_entropy(logits, targets[keep], reduction="sum")
+                loss = torch.nn.functional.cross_entropy(logits, targets[keep].to(logits.device), reduction="sum")
                 # Like the model's own loss: per token, over every token of the accumulated batch.
                 loss = loss / (num_items_in_batch if num_items_in_batch is not None else keep.sum().clamp(min=1))
                 return (loss, None) if return_outputs else loss

@@ -74,6 +74,16 @@ These times are estimates scaled from the lesson's measurements on the same mode
 (about 1.45 seconds per page per epoch of training, about 21 seconds to read a page one at a
 time; reading several at once is faster). Your smoke run gives the real speed.
 
+**What a run will cost, before it starts.** Notebook 2's Step 4b prints an estimate for the run
+chosen in Step 4: the images and pages it will go through, the time each took on the finished
+runs in `churro-work/runs`, and the bill at the instance's price (`scripts/cost.py`; a training
+job on `ml.g5.xlarge` is $1.26 an hour in US East (Ohio), a notebook instance $1.41). Measured on
+the team's runs up to 24 Nov: CHURRO trains at about 1.7 seconds per image, and at 6.5 to 12
+seconds per image with `train_vision` 1; a trained model reads a page in about 0.3 minutes, and
+plain CHURRO takes 1 to 2.5 minutes because its readings run on. So a survey run with
+`train_vision` 1 (319 images, 3 epochs) is about 5.7 hours and $7, a quarter of it the reading
+before training. `cost.bills()` lists what SageMaker billed for the jobs so far.
+
 ## Part 1: The notebook instance
 
 Create a notebook instance in the SageMaker console (Notebooks → Create notebook instance):

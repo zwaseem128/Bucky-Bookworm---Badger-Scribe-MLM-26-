@@ -37,7 +37,7 @@ import pandas as pd
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import (DENSE_CHARS, build_prompt, catalog_context, category_of, full_messages,  # noqa: E402
+from common import (DENSE_CHARS, build_prompt, catalog_context, category_of, chat_text, full_messages,  # noqa: E402
                     ink_chars, load_image, looks_wrong, training_text, user_messages)
 from finetune_churro import listed, load_model, page_cer_function, parse_box  # noqa: E402
 
@@ -59,8 +59,8 @@ def answer_logprob(model, processor, image, prompt, answer):
     """(mean log-probability of answer's tokens and the end mark after it, how many tokens)."""
     proc = processor
     proc.tokenizer.padding_side = "right"
-    full = proc.apply_chat_template(full_messages(prompt, answer), tokenize=False)
-    head = proc.apply_chat_template(user_messages(prompt), tokenize=False, add_generation_prompt=True)
+    full = chat_text(proc, full_messages(prompt, answer))
+    head = chat_text(proc, user_messages(prompt), add_generation_prompt=True)
     enc = proc(text=[full], images=[image], return_tensors="pt").to(model.device)
     n_head = proc(text=[head], images=[image], return_tensors="pt")["input_ids"].shape[1]
     ids = enc["input_ids"][0]

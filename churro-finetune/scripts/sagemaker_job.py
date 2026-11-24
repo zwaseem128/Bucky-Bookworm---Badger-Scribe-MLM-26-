@@ -22,8 +22,14 @@ scripts/guardrails.json in carpentries-incubator/ML_with_AWS_SageMaker) refuse a
 carries three tags: Project (one of the workshop's projects), Purpose, and Name (who started it).
 The refusal is an AccessDeniedException "with an explicit deny in an identity-based policy" that
 names neither the rule nor the fix. So every job is tagged Project = BadgerScribe, Purpose =
-Training and Name = the name saved in churro-work/my_settings.json. They also allow only
-single-GPU instance types (ml.g4dn/g5/g6/g6e.xlarge, ml.g6e.2xlarge) and at most 48 hours.
+Training and Name = the name saved in churro-work/my_settings.json. The workshop's own list
+allows only single-GPU instance types (ml.g4dn/g5/g6/g6e.xlarge, ml.g6e.2xlarge) and at most 48
+hours. ml.g6e.12xlarge (four 48 GB GPUs, for Qwen3.8-27B) is not on that list; Lokesh confirmed on
+24 Nov that this account allows it, so it is accepted here too.
+
+A model can need its own library versions and its own kind of machine (MODEL_SETUP in common.py):
+Qwen3.8-27B's jobs install requirements-qwen38.txt and are refused on anything but ml.g6e.12xlarge,
+where the model would not fit.
 """
 
 import glob
@@ -95,9 +101,26 @@ def _folders_to_ship(args, out_folder, work):
     return roots
 
 
+def _model_setup(args, work):
+    """MODEL_SETUP's entry for the model this job loads: named in the arguments, or, when a saved
+    run is read (Notebook 3), in that run's summary.json."""
+    from common import MODEL_SETUP, MODELS
+    names = [args.get("model_id")]
+    for value in args.values():
+        summary = os.path.join(str(value), "summary.json")
+        if isinstance(value, str) and value.startswith(work + "/") and os.path.exists(summary):
+            names.append(json.load(open(summary)).get("model_id"))
+    for name in names:
+        short = next((k for k, v in MODELS.items() if name in (k, v)), None)
+        if short in MODEL_SETUP:
+            return short, MODEL_SETUP[short]
+    return None, {}
+
+
 def _stage_code(work, args):
-    """The job's code: this folder's scripts, the competition's metric.py and requirements.txt,
-    and the script's arguments in job_args.json.
+    """The job's code: this folder's scripts, the competition's metric.py, the libraries to install
+    (requirements.txt, or the model's own list under that name) and the script's arguments in
+    job_args.json.
 
     The arguments travel in a file, not as SageMaker hyperparameters, because the container
     builds its command line from hyperparameters without quoting: an empty value such as
@@ -108,7 +131,8 @@ def _stage_code(work, args):
     for f in glob.glob(os.path.join(HERE, "*.py")):
         shutil.copy(f, stage)
     shutil.copy(os.path.join(REPO, "metric.py"), stage)
-    shutil.copy(os.path.join(NOTEBOOKS, "requirements.txt"), stage)
+    requirements = _model_setup(args, work)[1].get("requirements", "requirements.txt")
+    shutil.copy(os.path.join(NOTEBOOKS, requirements), os.path.join(stage, "requirements.txt"))
     with open(os.path.join(stage, "job_args.json"), "w", encoding="utf-8") as f:
         json.dump(args, f, indent=2)
     return stage
@@ -129,7 +153,7 @@ def _sdk():
 
 PROJECT = "BadgerScribe"   # the workshop's name for this project; the account accepts only its own list
 ALLOWED_INSTANCES = ("ml.t3.medium", "ml.m5.large", "ml.m5.xlarge", "ml.g4dn.xlarge", "ml.g5.xlarge",
-                     "ml.g6.xlarge", "ml.g6e.xlarge", "ml.g6e.2xlarge")
+                     "ml.g6.xlarge", "ml.g6e.xlarge", "ml.g6e.2xlarge", "ml.g6e.12xlarge")
 
 
 def _owner(work, owner=""):
@@ -162,6 +186,10 @@ def run_job(script, args, out_folder, *, work, bucket, run_name, instance_type="
                          + ", ".join(i for i in ALLOWED_INSTANCES if ".g" in i) + ".")
     if max_hours > 48:
         raise SystemExit("The workshop account refuses jobs allowed to run over 48 hours; set JOB_HOURS to 48 or less.")
+    big, setup = _model_setup(args, work)
+    if setup.get("instances") and instance_type not in setup["instances"]:
+        raise SystemExit(f"{big} doesn't fit on {instance_type}: it needs JOB_INSTANCE = "
+                         + " or ".join(f'"{i}"' for i in setup["instances"]) + " (Step 4).")
     sagemaker = _sdk()
     from sagemaker.huggingface import HuggingFace
 

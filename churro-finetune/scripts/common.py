@@ -30,6 +30,17 @@ MODELS = {
     "qwen3-vl-8b": "Qwen/Qwen3-VL-8B-Instruct",
     "qwen3-vl-4b": "Qwen/Qwen3-VL-4B-Instruct",
     "olmocr-2-7b": "allenai/olmOCR-2-7B-1025",
+    "qwen3.8-27b": "Qwen/Qwen3.8-27B",
+}
+# Qwen3.8-27B (Aug 2026, Apache-2.0) is a general vision-language model seven times CHURRO's size,
+# with no historical-handwriting training. Three things set it apart from the others here:
+# - It is 56 GB in bf16, more than any single GPU the account offers (an L40S has 48 GB), so it
+#   is spread over the four GPUs of an ml.g6e.12xlarge (load_model in finetune_churro.py).
+# - Its architecture ("qwen3_5") is newer than the transformers version the other models are
+#   pinned to, so its jobs install requirements-qwen38.txt instead of requirements.txt.
+# - It "thinks" before answering unless told not to; chat_text() below tells it not to.
+MODEL_SETUP = {
+    "qwen3.8-27b": {"requirements": "requirements-qwen38.txt", "instances": ("ml.g6e.12xlarge",)},
 }
 
 # Qwen2.5-VL (which CHURRO is built on) turns every 28 x 28 pixel block into one
@@ -146,6 +157,17 @@ def full_messages(prompt: str, answer: str):
     return user_messages(prompt) + [{"role": "assistant", "content": [{"type": "text", "text": answer}]}]
 
 
+def chat_text(processor, messages, add_generation_prompt: bool = False) -> str:
+    """The messages as the model's own chat text, with thinking switched off.
+
+    Qwen3.8's template opens a "<think>" block for the model to reason in unless enable_thinking
+    is False; then it writes an empty one, exactly as it does before an answer in training text,
+    so the prompt a page is read with is the start of the text it was trained on. The templates
+    of CHURRO, olmOCR and Qwen3-VL have no such switch and ignore it."""
+    return processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_generation_prompt,
+                                         enable_thinking=False)
+
+
 # ---------------------------------------------------------------------------
 # Survey spreads: every survey image is an open notebook, two pages side by
 # side. Reading across the fold mixes the pages up, so each spread is cut in
@@ -225,6 +247,7 @@ _OLMOCR_HEADER = re.compile(r"\A\s*---\s*\n(?:[a-z_]+:[^\n]*\n)+---\s*(?:\n|\Z)"
 
 def clean_output(text: str, category: str = "", max_chars: int = 3000) -> str:
     text = _OLMOCR_HEADER.sub("", text, count=1)
+    text = re.sub(r"<think>.*?(?:</think>|\Z)", "", text, flags=re.S)   # a thinking block (Qwen3.8), should one slip through
     text = text.translate(_PLAIN)
     text = re.sub(r"```[a-z]*", "", text)                  # markdown code fences
     text = text.replace("**", "").replace("__", "")        # markdown bold
