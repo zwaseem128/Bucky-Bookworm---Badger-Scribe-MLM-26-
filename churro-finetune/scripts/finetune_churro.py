@@ -283,11 +283,25 @@ def load_model(model_id, max_pixels, adapter_dir=None, compare_dir=None):
     from peft import PeftModel
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
+    from common import FOUR_BIT
+    four_bit = model_id in FOUR_BIT
     model_id = MODELS.get(model_id, model_id)
     dtype = pick_dtype()
     check_cudnn(dtype)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"loading {model_id} in {dtype}", flush=True)
+    print(f"loading {model_id} in {'4-bit (NF4), computing in ' if four_bit else ''}{dtype}", flush=True)
+    quant = {}
+    if four_bit:
+        # NF4 with double quantization, the QLoRA recipe: the language layers' weights are stored in
+        # 4 bits and turned back into bf16 a layer at a time to compute. The image encoder ("visual")
+        # and the output layer stay in bf16: they are small, and the image side is the most
+        # sensitive to rounding. The LoRA layers trained on top are bf16 as usual.
+        if device != "cuda":
+            raise SystemExit("A 4-bit model needs a CUDA GPU (bitsandbytes).")
+        from transformers import BitsAndBytesConfig
+        quant = {"quantization_config": BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=dtype, llm_int8_skip_modules=["visual", "lm_head"])}
     # Load straight onto the GPU. Loading to the CPU first and then moving it needs the whole model in
     # RAM: Qwen3-VL-8B is about 17.5 GB in bf16, more than the 16 GB an ml.g5.xlarge has.
     # A machine with several GPUs (ml.g6e.12xlarge has four) gets the model spread over them, layer
@@ -295,7 +309,10 @@ def load_model(model_id, max_pixels, adapter_dir=None, compare_dir=None):
     # than 48 GB. A page then passes from one GPU to the next, so it is no faster than one GPU.
     n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
     model = AutoModelForImageTextToText.from_pretrained(model_id, dtype=dtype, attn_implementation="sdpa",
-                                                        device_map="auto" if n_gpus > 1 else {"": device})
+                                                        device_map="auto" if n_gpus > 1 and not four_bit else {"": device},
+                                                        **quant)
+    if four_bit:
+        print(f"loaded in 4-bit: {torch.cuda.memory_allocated() / 1e9:.1f} GB on the GPU", flush=True)
     if n_gpus > 1:
         used = sorted({str(d) for d in getattr(model, "hf_device_map", {}).values()})
         print(f"spread over {len(used)} of {n_gpus} GPUs: " + ", ".join(
@@ -722,8 +739,20 @@ def oversampled(items, setting):
     extra = []
     for part in [s for s in str(setting).split(",") if ":" in s]:
         cat, times = part.split(":")
-        extra += [items[items.category == cat.strip()]] * (int(times) - 1)
+        cat = cat.strip()
+        if cat.endswith("_short"):
+            # 'dominy_accounts_short:4' repeats only that collection's short pages (labels under
+            # SHORT_PAGE_CHARS characters: envelope covers and folded dockets). They are 7.5% of
+            # Dominy training images but 7 of its 17 dev pages, and most of its dev error.
+            base = cat[:-len("_short")]
+            rows = items[(items.category == base) & (items.text.str.len() < SHORT_PAGE_CHARS)]
+        else:
+            rows = items[items.category == cat]
+        extra += [rows] * (int(times) - 1)
     return pd.concat([items, *extra]) if extra else items
+
+
+SHORT_PAGE_CHARS = 150
 
 
 class PageDataset(Dataset):
@@ -1004,6 +1033,9 @@ def main():
                 loss = torch.nn.functional.cross_entropy(logits, targets[keep].to(logits.device), reduction="sum")
                 # Like the model's own loss: per token, over every token of the accumulated batch.
                 loss = loss / (num_items_in_batch if num_items_in_batch is not None else keep.sum().clamp(min=1))
+                # Hand the loss back on the Trainer's own device: transformers 5 keeps its running
+                # total on args.device (cuda:0) and refuses a loss from the last GPU of a split model.
+                loss = loss.to(self.args.device)
                 return (loss, None) if return_outputs else loss
 
         trainer = LabelOnlyLoss(model=model, args=targs,

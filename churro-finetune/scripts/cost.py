@@ -48,7 +48,7 @@ GPU_GB = {"ml.g4dn.xlarge": 16, "ml.g5.xlarge": 24, "ml.g6.xlarge": 24, "ml.g6e.
           "ml.g6e.12xlarge": 192}
 
 # Model sizes in billions of parameters, to scale a model with no finished run from one that has.
-PARAMS = {"churro": 3.8, "qwen3-vl-4b": 4.4, "qwen3-vl-8b": 8.8, "olmocr-2-7b": 8.3, "qwen3.8-27b": 27.8}
+PARAMS = {"churro": 3.8, "qwen3-vl-4b": 4.4, "qwen3-vl-8b": 8.8, "olmocr-2-7b": 8.3, "qwen3.8-27b": 27.8, "lightonocr-3-4b": 4.6, "qwen3.8-27b-4bit": 27.8}
 
 # Used only when churro-work/runs has no finished run to measure: CHURRO on ml.g5.xlarge, from the
 # team's runs up to 24 Nov 2026. Training the image side too (train_vision 1) took 6.5 s (Kade)
@@ -236,7 +236,12 @@ def estimate(settings, data_dir, runs_dir, instance="ml.g5.xlarge", max_hours=No
     notes = []
     slow = 1 / GPU_SPEED.get(instance, 1.0)
     weights_gb = PARAMS.get(model, PARAMS["churro"]) * 2          # bf16: two bytes per parameter
-    if weights_gb + 4 > GPU_GB.get(instance, 24):
+    if model.endswith("-4bit"):
+        # downloaded in bf16 (weights_gb, for the start-up time), then held in 4-bit
+        slow *= FOUR_BIT_SLOWDOWN
+        notes.append(f"{model} loads in 4-bit (about {PARAMS.get(model, 0) * 0.6:.0f} GB on the GPU); its figures "
+                     f"include x{FOUR_BIT_SLOWDOWN} for turning the 4-bit weights back into bf16 as it computes.")
+    elif weights_gb + 4 > GPU_GB.get(instance, 24):
         slow *= FOUR_BIT_SLOWDOWN
         notes.append(f"{model} is about {weights_gb:.0f} GB in bf16, more than this GPU's {GPU_GB.get(instance, 24)} GB: it would have "
                      f"to load in 4-bit, which these scripts don't do yet (figures include x{FOUR_BIT_SLOWDOWN} for that).")

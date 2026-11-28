@@ -31,7 +31,20 @@ MODELS = {
     "qwen3-vl-4b": "Qwen/Qwen3-VL-4B-Instruct",
     "olmocr-2-7b": "allenai/olmOCR-2-7B-1025",
     "qwen3.8-27b": "Qwen/Qwen3.8-27B",
+    "lightonocr-3-4b": "yale-cultural-heritage/LightOnOCR-3-4B-cultural-heritage-eng",
+    "qwen3.8-27b-4bit": "Qwen/Qwen3.8-27B",
 }
+# qwen3.8-27b-4bit is the same Qwen3.8-27B, with its language layers loaded in 4-bit (NF4, bitsandbytes)
+# and trained with LoRA on top ("QLoRA"): about 17 GB instead of 56, so it fits one L40S
+# (ml.g6e.xlarge, $2.61 an hour, no queue) instead of needing all four of an ml.g6e.12xlarge. The image
+# encoder and the output layer stay in bf16. An adapter trained on it must be read with it too
+# (Notebook 3 takes the model from the run's summary.json), since the 4-bit weights differ slightly.
+# LightOnOCR-3-4B (LightOn, Apache-2.0) is an OCR model built on Qwen3.5, the same architecture as
+# Qwen3.8-27B, so it loads and trains the same way, but it is 4.6 B parameters (about 9 GB in bf16)
+# and fits one GPU. The checkpoint here is Yale Library's fine-tune of it on 11,029 pages of
+# handwritten English archival documents, transcribed keeping the original spelling (CER 0.077 on
+# their held-out pages, the best of the models they tried). It was trained at about 2 MP per page,
+# with its own prompt and [[...]] markup; our training replaces both with ours.
 # Qwen3.8-27B (Aug 2026, Apache-2.0) is a general vision-language model seven times CHURRO's size,
 # with no historical-handwriting training. Three things set it apart from the others here:
 # - It is 56 GB in bf16, more than any single GPU the account offers (an L40S has 48 GB), so it
@@ -41,7 +54,12 @@ MODELS = {
 # - It "thinks" before answering unless told not to; chat_text() below tells it not to.
 MODEL_SETUP = {
     "qwen3.8-27b": {"requirements": "requirements-qwen38.txt", "instances": ("ml.g6e.12xlarge",)},
+    "lightonocr-3-4b": {"requirements": "requirements-qwen38.txt",
+                        "instances": ("ml.g6e.xlarge", "ml.g6e.2xlarge", "ml.g5.xlarge", "ml.g6.xlarge")},
+    "qwen3.8-27b-4bit": {"requirements": "requirements-qwen38-4bit.txt", "four_bit": True,
+                         "instances": ("ml.g6e.xlarge", "ml.g6e.2xlarge")},
 }
+FOUR_BIT = {k for k, v in MODEL_SETUP.items() if v.get("four_bit")}   # model names loaded in 4-bit
 
 # Qwen2.5-VL (which CHURRO is built on) turns every 28 x 28 pixel block into one
 # image token. Each image is resized to at most MAX_PIXELS, about a megapixel or

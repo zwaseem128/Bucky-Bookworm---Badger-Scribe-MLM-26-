@@ -1,5 +1,5 @@
-# Only for jobs with MODEL = "qwen3.8-27b" (MODEL_SETUP in scripts/common.py). Its architecture
-# is newer than the transformers version in requirements.txt, which the other models stay on.
+# Only for jobs with MODEL = "qwen3.8-27b" or "lightonocr-3-4b" (MODEL_SETUP in scripts/common.py). Its architecture
+# (Qwen3.5) is newer than the transformers version in requirements.txt, which the other models stay on.
 transformers==5.24.0
 peft==0.22.0
 accelerate>=1.10

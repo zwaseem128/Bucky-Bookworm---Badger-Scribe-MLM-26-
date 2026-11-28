@@ -1,0 +1,8 @@
+# Only for jobs with MODEL = "qwen3.8-27b-4bit" (MODEL_SETUP in scripts/common.py): requirements-qwen38.txt
+# plus bitsandbytes, which loads Qwen3.8-27B's language layers in 4-bit so the model fits one 48 GB GPU.
+transformers==5.24.0
+peft==0.22.0
+accelerate>=1.10
+bitsandbytes>=0.48
+pillow
+pandas
